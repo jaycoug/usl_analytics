@@ -1,0 +1,710 @@
+---
+title: "Exploring the USL Championship Database in R"
+subtitle: "A step-by-step tutorial for working with SQLite and relational data"
+author: "USL Championship Data Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# Introduction
+
+This notebook walks through the **USL Championship SQLite database** from
+the ground up. By running each code block in order you will learn how to:
+
+1. Connect to a `.db` file from R using the `DBI` and `RSQLite` packages.
+2. Discover what tables and views exist inside the database.
+3. Read entire tables into data frames and inspect their structure.
+4. Write SQL queries — from simple SELECTs to JOINs, aggregations, and window
+   functions — and pull the results directly into R.
+5. Use `dplyr` / `dbplyr` to query the database with tidyverse syntax *without*
+   writing raw SQL.
+6. Understand how foreign keys tie the tables together and how to navigate a
+   relational schema.
+
+> **Prerequisites:** Install the required packages before running any chunks.
+
+```{r install-packages, eval=FALSE}
+install.packages(c("DBI", "RSQLite", "tidyverse", "dbplyr", "knitr", "kableExtra"))
+```
+
+```{r load-libraries}
+library(DBI)
+library(RSQLite)
+library(tidyverse)
+library(dbplyr)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# 1 — Connecting to the Database
+
+`DBI::dbConnect()` opens a connection to a SQLite file. If the file does not
+exist, SQLite will silently create an empty database — so always double-check
+the path.
+
+```{r connect}
+# Update this path to wherever your copy of the database lives.
+db_path <- "usl_championship.db"
+
+# Open the connection
+con <- dbConnect(RSQLite::SQLite(), dbname = db_path)
+
+# Quick sanity check — print the connection object
+con
+```
+
+> **Tip:** Keep `con` open for the entire session. We will close it at the very
+> end. Every query below reuses this single connection.
+
+### Turning on foreign key enforcement
+
+SQLite does not enforce foreign keys by default. If you plan to write data or
+want constraint checks while exploring, flip the pragma on:
+
+```{r fk-pragma}
+dbExecute(con, "PRAGMA foreign_keys = ON;")
+```
+
+---
+
+# 2 — Discovering the Schema
+
+Before writing any queries, find out what is inside the database.
+
+## 2.1 List all tables and views
+
+```{r list-tables}
+# Tables
+tables <- dbListTables(con)
+cat("Tables and views in the database:\n")
+print(tables)
+```
+
+## 2.2 Row counts for every table
+
+A quick way to gauge how much data each table holds:
+
+```{r row-counts}
+row_counts <- tibble(
+  table_name = tables
+) %>%
+  rowwise() %>%
+  mutate(
+    rows = dbGetQuery(con, paste0("SELECT COUNT(*) AS n FROM [", table_name, "]"))$n
+  ) %>%
+  ungroup() %>%
+  arrange(desc(rows))
+
+row_counts %>%
+  kable(col.names = c("Table / View", "Row Count"), format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 2.3 Inspect column definitions
+
+`PRAGMA table_info()` returns the column name, type, nullability, default value,
+and primary-key flag for any table.
+
+```{r schema-inspect}
+# Helper: return a tidy data frame of column info for one table
+get_schema <- function(con, tbl) {
+  dbGetQuery(con, paste0("PRAGMA table_info('", tbl, "');")) %>%
+    as_tibble() %>%
+    select(cid, name, type, notnull, dflt_value, pk)
+}
+
+# Example: look at the 'players' table
+get_schema(con, "players") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+## 2.4 View the full schema DDL
+
+For a deeper look, you can pull the original `CREATE TABLE` / `CREATE VIEW`
+statements:
+
+```{r full-ddl}
+ddl <- dbGetQuery(con, "
+  SELECT type, name, sql
+  FROM sqlite_master
+  WHERE sql IS NOT NULL
+  ORDER BY
+    CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 ELSE 3 END,
+    name
+")
+
+# Print each statement
+walk2(ddl$name, ddl$sql, ~ {
+  cat(paste0("-- ", .x, "\n"))
+  cat(.y, "\n\n")
+})
+```
+
+---
+
+# 3 — Reading Tables into R
+
+## 3.1 The quick way: `dbReadTable()`
+
+`dbReadTable()` pulls an entire table into a data frame. This is fine for
+small reference tables but be cautious with large tables — you are loading
+everything into memory at once.
+
+```{r read-teams}
+teams <- dbReadTable(con, "teams")
+glimpse(teams)
+```
+
+```{r read-stadiums}
+stadiums <- dbReadTable(con, "stadiums")
+glimpse(stadiums)
+```
+
+```{r read-players}
+players <- dbReadTable(con, "players")
+glimpse(players)
+```
+
+## 3.2 Preview large tables first
+
+For bigger tables like `player_snaps` and `matches`, preview before committing
+to a full read:
+
+```{r preview-snaps}
+# Fetch just the first 10 rows
+dbGetQuery(con, "SELECT * FROM player_snaps LIMIT 10") %>%
+  glimpse()
+```
+
+```{r read-matches}
+matches <- dbReadTable(con, "matches")
+glimpse(matches)
+```
+
+```{r read-appearances}
+appearances <- dbReadTable(con, "appearances")
+glimpse(appearances)
+```
+
+> **When to use `dbReadTable()` vs. `dbGetQuery()`:**
+>
+> - `dbReadTable(tbl)` — grab the whole table (convenient, but no filtering).
+> - `dbGetQuery(sql)` — run any SQL and return a data frame (full control).
+>
+> A good rule of thumb: if the table has fewer than ~50 000 rows and you want
+> all of it, `dbReadTable()` is fine. Otherwise, filter server-side with SQL.
+
+---
+
+# 4 — Querying with SQL
+
+This section walks through increasingly complex SQL patterns, all executed
+against the live database.
+
+## 4.1 Simple SELECT
+
+Retrieve all 24 teams sorted by conference and city:
+
+```{r sql-select}
+dbGetQuery(con, "
+  SELECT team_id, name, city, abbreviation, conference
+  FROM teams
+  ORDER BY conference, city
+") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 4.2 Filtering with WHERE
+
+Find all goalkeepers in the database:
+
+```{r sql-where}
+dbGetQuery(con, "
+  SELECT player_id, name, nation, position
+  FROM players
+  WHERE position = 'Goalkeeper'
+  ORDER BY name
+  LIMIT 15
+") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+## 4.3 Aggregation: GROUP BY and HAVING
+
+Count the number of players by nationality, showing only countries with 5+
+players:
+
+```{r sql-group}
+dbGetQuery(con, "
+  SELECT nation, COUNT(*) AS player_count
+  FROM players
+  WHERE nation IS NOT NULL
+  GROUP BY nation
+  HAVING COUNT(*) >= 5
+  ORDER BY player_count DESC
+") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+## 4.4 JOINs — connecting related tables
+
+### Teams and their stadiums
+
+```{r sql-join-stadium}
+dbGetQuery(con, "
+  SELECT t.name AS team, t.conference,
+         s.name AS stadium, s.city AS stadium_city
+  FROM teams t
+  LEFT JOIN stadiums s ON t.stadium_id = s.stadium_id
+  ORDER BY t.conference, t.name
+") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Top scorers with team names
+
+This joins the `v_player_summaries` view to `players` and `teams` to show
+human-readable names alongside the stats:
+
+```{r sql-top-scorers}
+dbGetQuery(con, "
+  SELECT p.name AS player,
+         t.abbreviation AS team,
+         ps.goals,
+         ps.assists,
+         ps.games_played,
+         ROUND(CAST(ps.goals AS REAL) / NULLIF(ps.games_played, 0), 2)
+           AS goals_per_game
+  FROM v_player_summaries ps
+  JOIN players p ON ps.player_id = p.player_id
+  JOIN teams t   ON ps.team_id   = t.team_id
+  WHERE ps.goals > 0
+  ORDER BY ps.goals DESC, ps.assists DESC
+  LIMIT 20
+") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 4.5 Using views
+
+The database ships with three prebuilt views. They work exactly like tables
+in a `SELECT` statement:
+
+```{r sql-standings}
+standings <- dbGetQuery(con, "SELECT * FROM v_standings")
+standings %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r sql-rosters-sample}
+# Current roster for one team
+dbGetQuery(con, "
+  SELECT team_name, player_name, position, jersey_number, is_captain
+  FROM v_current_rosters
+  WHERE abbreviation = 'LOU'
+  ORDER BY jersey_number
+") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+> **What is a view?** A view is a saved query — it doesn't store any data.
+> Every time you `SELECT` from it, the underlying query runs against the real
+> tables. This means views are always up-to-date but can be slower than a
+> materialized table for very heavy queries.
+
+## 4.6 Subqueries and CASE expressions
+
+Find each team's home and away records:
+
+```{r sql-home-away}
+dbGetQuery(con, "
+  SELECT
+    t.name,
+    SUM(CASE WHEN m.home_team_id = t.team_id AND m.home_score > m.away_score
+             THEN 1 ELSE 0 END) AS home_wins,
+    SUM(CASE WHEN m.away_team_id = t.team_id AND m.away_score > m.home_score
+             THEN 1 ELSE 0 END) AS away_wins,
+    COUNT(*) AS total_matches
+  FROM teams t
+  JOIN matches m ON t.team_id IN (m.home_team_id, m.away_team_id)
+  WHERE m.competition = 'League'
+  GROUP BY t.team_id
+  HAVING total_matches > 0
+  ORDER BY home_wins + away_wins DESC
+") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# 5 — The Tidyverse Way: dbplyr
+
+`dbplyr` lets you write `dplyr` verbs (`filter`, `select`, `mutate`,
+`summarise`, `left_join`, etc.) that are automatically translated into SQL
+and run on the database. Nothing is pulled into R until you call `collect()`.
+
+## 5.1 Creating lazy table references
+
+```{r dbplyr-refs}
+# tbl() creates a lazy reference — no data is fetched yet
+tbl_teams      <- tbl(con, "teams")
+tbl_players    <- tbl(con, "players")
+tbl_matches    <- tbl(con, "matches")
+tbl_snaps      <- tbl(con, "player_snaps")
+tbl_rosters    <- tbl(con, "season_rosters")
+tbl_appear     <- tbl(con, "appearances")
+```
+
+## 5.2 Inspect the generated SQL
+
+One of the best features of `dbplyr`: you can see the SQL it writes for you
+using `show_query()`.
+
+```{r dbplyr-show-query}
+tbl_players %>%
+  filter(position == "Forward") %>%
+  select(player_id, name, nation) %>%
+  arrange(name) %>%
+  head(10) %>%
+  show_query()
+```
+
+## 5.3 Aggregation with dplyr verbs
+
+```{r dbplyr-nation-counts}
+tbl_players %>%
+  filter(!is.na(nation)) %>%
+  count(nation, sort = TRUE) %>%
+  filter(n >= 5) %>%
+  collect() %>%
+  kable(col.names = c("Nationality", "Players")) %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+## 5.4 Joining tables the tidy way
+
+```{r dbplyr-join}
+tbl_rosters %>%
+  filter(season == 2025, is_captain == 1) %>%
+  inner_join(tbl_players, by = "player_id") %>%
+  inner_join(tbl_teams, by = "team_id") %>%
+  select(team = name.y, captain = name.x, position, jersey_number) %>%
+  arrange(team) %>%
+  collect() %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 5.5 When to `collect()`
+
+`collect()` executes the query and pulls the result into a local tibble. Key
+guidelines:
+
+- **Delay** `collect()` as long as possible — let the database do the filtering,
+  joining, and aggregating.
+- **Call** `collect()` when you need the data in R for plotting, modeling, or
+  any operation that `dbplyr` can't translate to SQL (e.g., string
+  manipulations with `stringr`, custom functions).
+
+```{r dbplyr-collect-example}
+# Build a pipeline entirely on the DB, then collect for plotting
+goals_by_team <- tbl_snaps %>%
+  group_by(team_id) %>%
+  summarise(total_goals = sum(goals, na.rm = TRUE), .groups = "drop") %>%
+  inner_join(tbl_teams, by = "team_id") %>%
+  select(team = name, total_goals) %>%
+  arrange(desc(total_goals)) %>%
+  collect()
+
+# Now plot in R
+ggplot(goals_by_team, aes(x = reorder(team, total_goals), y = total_goals)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Total Goals by Team (Player Snapshots)",
+    x = NULL, y = "Goals"
+  ) +
+  theme_minimal()
+```
+
+---
+
+# 6 — Understanding the Relational Model
+
+## 6.1 Entity-relationship overview
+
+The database is organized in four tiers:
+ 
+| Tier | Tables | Update Frequency |
+|------|--------|------------------|
+| **Reference** | `stadiums`, `teams`, `players` | Rarely changes |
+| **Season** | `season_rosters`, `season_staff`, `season_team_stats` | Annually |
+| **Match** | `matches`, `appearances` | Weekly during season |
+| **Snapshot** | `raw_snapshots`, `player_snaps` | Per ingestion run |
+
+The key relationships are:
+
+- `teams.stadium_id` → `stadiums.stadium_id` (each team has a home stadium)
+- `season_rosters.team_id` → `teams.team_id` (roster assignment)
+- `season_rosters.player_id` → `players.player_id` (which player)
+- `matches.home_team_id` / `away_team_id` → `teams.team_id`
+- `appearances.match_id` → `matches.match_id`
+- `appearances.player_id` → `players.player_id`
+- `player_snaps.team_id` → `teams.team_id`
+- `player_snaps.player_id` → `players.player_id`
+
+## 6.2 Exploring foreign keys
+
+SQLite stores foreign key metadata that you can query directly:
+
+```{r fk-inspect}
+# List foreign keys for a given table
+get_fks <- function(con, tbl_name) {
+  dbGetQuery(con, paste0("PRAGMA foreign_key_list('", tbl_name, "');"))
+}
+
+# Show FKs for several tables
+fk_tables <- c("teams", "matches", "appearances", "player_snaps", "season_rosters")
+
+map_dfr(fk_tables, ~ {
+  fks <- get_fks(con, .x)
+  if (nrow(fks) > 0) {
+    fks %>% mutate(source_table = .x, .before = 1)
+  }
+}) %>%
+  select(source_table, from_col = from, references_table = table, to_col = to) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 6.3 Checking for orphan records
+
+A common data-quality check: do any child records reference parent IDs that
+don't exist?
+
+```{r orphan-check}
+# Are there any appearances referencing a match_id not in matches?
+orphan_appearances <- dbGetQuery(con, "
+  SELECT a.match_id, a.player_id
+  FROM appearances a
+  LEFT JOIN matches m ON a.match_id = m.match_id
+  WHERE m.match_id IS NULL
+")
+cat("Orphan appearances (no matching match):", nrow(orphan_appearances), "\n")
+
+# Any player_snaps referencing a player_id not in players?
+orphan_snaps <- dbGetQuery(con, "
+  SELECT ps.player_id, ps.team_id, ps.snap_date
+  FROM player_snaps ps
+  LEFT JOIN players p ON ps.player_id = p.player_id
+  WHERE p.player_id IS NULL
+")
+cat("Orphan player_snaps (no matching player):", nrow(orphan_snaps), "\n")
+```
+
+---
+
+# 7 — Parameterized Queries
+
+Hard-coding values into SQL strings invites SQL injection and makes code
+brittle. Use parameterized queries instead:
+
+```{r parameterized}
+# Safe: the ? placeholder is filled in by dbGetQuery's params argument
+team_abbr <- "LOU"
+
+roster <- dbGetQuery(con, "
+  SELECT p.name, p.position, sr.jersey_number
+  FROM season_rosters sr
+  JOIN players p ON sr.player_id = p.player_id
+  JOIN teams t   ON sr.team_id   = t.team_id
+  WHERE t.abbreviation = ? AND sr.season = ?
+  ORDER BY sr.jersey_number
+", params = list(team_abbr, 2025))
+
+roster %>%
+  kable(caption = paste("2025 Roster:", team_abbr)) %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+> **Why parameterize?** Even in an analysis notebook you should build the habit.
+> The database driver handles type conversion, quoting, and escaping for you,
+> which eliminates a whole class of bugs.
+
+---
+
+# 8 — Practical Analysis Examples
+
+## 8.1 Player snapshot deep dive
+
+Pull the full stat line for a single player across all their snapshots to see
+how cumulative stats grow over the season:
+
+```{r player-timeline}
+# Pick a player with multiple snapshots
+multi_snap_player <- dbGetQuery(con, "
+  SELECT player_id, COUNT(*) as snap_count
+  FROM player_snaps
+  GROUP BY player_id
+  HAVING snap_count > 1
+  ORDER BY snap_count DESC
+  LIMIT 1
+")
+
+if (nrow(multi_snap_player) > 0) {
+  pid <- multi_snap_player$player_id[1]
+
+  timeline <- dbGetQuery(con, "
+    SELECT ps.snap_date, p.name, ps.games_played, ps.goals, ps.assists,
+           ps.mins_played, ps.shots_on_target
+    FROM player_snaps ps
+    JOIN players p ON ps.player_id = p.player_id
+    WHERE ps.player_id = ?
+    ORDER BY ps.snap_date
+  ", params = list(pid))
+
+  timeline %>%
+    kable(caption = paste("Snapshot Timeline:", timeline$name[1])) %>%
+    kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+} else {
+  cat("No players with multiple snapshots found.\n")
+}
+```
+
+## 8.2 Match results heatmap data
+
+Prepare a home-vs-away matrix of results:
+
+```{r match-matrix}
+result_matrix <- dbGetQuery(con, "
+  SELECT
+    ht.abbreviation AS home,
+    at.abbreviation AS away,
+    m.home_score,
+    m.away_score,
+    m.date
+  FROM matches m
+  JOIN teams ht ON m.home_team_id = ht.team_id
+  JOIN teams at ON m.away_team_id = at.team_id
+  WHERE m.competition = 'League'
+  ORDER BY m.date
+")
+
+result_matrix %>%
+  mutate(result_label = paste0(home_score, "-", away_score)) %>%
+  select(date, home, away, result_label) %>%
+  kable(caption = "League Match Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 8.3 Position distribution across the league
+
+```{r position-dist}
+pos_data <- dbGetQuery(con, "
+  SELECT p.position, COUNT(*) AS n
+  FROM players p
+  WHERE p.position IS NOT NULL
+  GROUP BY p.position
+  ORDER BY n DESC
+")
+
+ggplot(pos_data, aes(x = reorder(position, n), y = n)) +
+  geom_col(fill = "coral") +
+  coord_flip() +
+  labs(title = "Players by Position", x = NULL, y = "Count") +
+  theme_minimal()
+```
+
+---
+
+# 9 — Tips for Working with Relational Databases in R
+
+1. **Always close your connection** when you are done (`dbDisconnect(con)`).
+   Open connections hold file locks and consume resources.
+
+2. **Let the database do the heavy lifting.** Filter, join, and aggregate in
+   SQL (or `dbplyr`) before pulling data into R. Transferring millions of rows
+   only to `filter()` them locally is wasteful.
+
+3. **Use `dbplyr` for exploration, raw SQL for production.** `dbplyr` is
+   excellent for iterative analysis because you can build queries incrementally.
+   For final reports or scheduled jobs, explicit SQL gives you full control and
+   is easier to optimize.
+
+4. **Watch out for type coercion.** SQLite is loosely typed — a column declared
+   as `INTEGER` can still contain text. R's `dbReadTable()` will guess types,
+   but you may need to cast manually with `as.integer()`, `as.Date()`, etc.
+
+5. **Beware of `NULL` vs. `NA`.** SQL `NULL` becomes R `NA` when fetched, but
+   the behavior inside SQL (`IS NULL`, `COALESCE`, `NULLIF`) is different from
+   R's `is.na()` and `replace_na()`. Be explicit on both sides.
+
+6. **Use transactions for writes.** If you are inserting or updating data,
+   wrap your operations in `dbBegin()` / `dbCommit()` (or `dbRollback()` on
+   failure) to keep the database consistent.
+
+7. **Index columns you filter on.** If you repeatedly query by `team_id` or
+   `player_id`, adding an index speeds things up enormously for larger datasets:
+   `dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_snaps_player ON player_snaps(player_id)")`.
+
+8. **Composite primary keys matter.** Several tables here — `season_rosters`,
+   `appearances`, `player_snaps` — use multi-column primary keys. When joining
+   or deduplicating, you need *all* key columns, not just one.
+
+---
+
+# 10 — Cleanup
+
+Always disconnect when you are finished:
+
+```{r disconnect}
+dbDisconnect(con)
+cat("Connection closed.\n")
+```
+
+---
+
+# Appendix: Quick Reference
+
+| Task | Function |
+|------|----------|
+| Connect | `dbConnect(RSQLite::SQLite(), "file.db")` |
+| List tables | `dbListTables(con)` |
+| Read whole table | `dbReadTable(con, "table_name")` |
+| Run SQL → data frame | `dbGetQuery(con, "SELECT ...")` |
+| Run SQL (no result) | `dbExecute(con, "INSERT ...")` |
+| Lazy dplyr reference | `tbl(con, "table_name")` |
+| See generated SQL | `... %>% show_query()` |
+| Pull lazy → local | `... %>% collect()` |
+| Column metadata | `dbGetQuery(con, "PRAGMA table_info('tbl')")` |
+| Foreign keys | `dbGetQuery(con, "PRAGMA foreign_key_list('tbl')")` |
+| Disconnect | `dbDisconnect(con)` |
