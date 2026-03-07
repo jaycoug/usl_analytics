@@ -1,0 +1,711 @@
+---
+title: "USL Championship — CSV Ingestion Pipeline"
+subtitle: "Convert, review, and import snapshot data into the SQLite database"
+author: "USL Championship Data Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This notebook ingests data from `.csv` files (converted from `.xlsx` exports)
+into the `usl_championship.db` SQLite database. **Run each section in order,
+one chunk at a time in RStudio.** Do not knit the whole document in one shot —
+Section 3 requires you to review a table and edit a vector before continuing.
+
+The pipeline covers:
+
+1. **Convert** — turn any new `.xlsx` files into `.csv`
+2. **Ingest named CSVs** — sync `matches`, `players`, `appearances`, etc.
+3. **Review new player names** — inspect unmatched names from the numbered
+   snapshot CSVs before adding them to the `players` table
+4. **Add approved players** — insert only the names you have validated
+5. **Ingest snapshot CSVs** — load per-team, per-date stat files into
+   `raw_snapshots` and `player_snaps`
+6. **Audit** — verify counts and see what (if anything) was still skipped
+
+---
+
+# 0 — Setup
+
+```{r install-packages, eval=FALSE}
+install.packages(c(
+  "DBI", "RSQLite", "readxl", "readr", "dplyr",
+  "stringi", "lubridate", "knitr", "kableExtra"
+))
+```
+
+```{r load-libraries}
+library(DBI)
+library(RSQLite)
+library(readxl)
+library(readr)
+library(dplyr)
+library(stringi)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+```
+
+## Paths and connection
+
+**Edit `base` and `db_path` to match wherever your files live.**
+
+```{r config}
+base    <- "/home/jaycoughlon/Desktop/usl_analytics/"
+db_path <- paste0(base, "usl_championship.db")
+
+con <- dbConnect(RSQLite::SQLite(), dbname = db_path)
+cat("Connected to:", db_path, "\n")
+```
+
+---
+
+## Helper functions
+
+These are used throughout the notebook. Run this chunk once and leave it.
+
+```{r helpers}
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_msg <- function(...) cat(format(Sys.time(), "[%H:%M:%S]"), ..., "\n")
+
+# ── Safe insert: append only if there are rows to add ────────────────────────
+safe_insert <- function(con, table, df) {
+  if (nrow(df) == 0) return(invisible(0L))
+  dbWriteTable(con, table, df, append = TRUE)
+  invisible(nrow(df))
+}
+
+# ── Convert "First Last" → "Last, First" (handles II/III/Jr./Sr. suffixes) ──
+to_last_first <- function(name) {
+  suffixes <- c("II", "III", "IV", "Jr.", "Sr.", "Jr", "Sr")
+  parts    <- strsplit(trimws(name), " ")[[1]]
+  suffix   <- ""
+  if (length(parts) > 1 && parts[length(parts)] %in% suffixes) {
+    suffix <- paste0(" ", parts[length(parts)])
+    parts  <- parts[-length(parts)]
+  }
+  if (length(parts) == 1) return(paste0(parts[1], suffix))
+  last  <- parts[length(parts)]
+  first <- paste(parts[-length(parts)], collapse = " ")
+  paste0(last, suffix, ", ", first)
+}
+
+# ── Build a name-lookup table from the DB (all players) ──────────────────────
+# Returns a data frame with columns: player_id, name, name_fl, name_norm
+# name_fl   = "First Last" version of the DB's "Last, First" format
+# name_norm = accent-stripped name_fl for fuzzy matching
+build_name_lookup <- function(con) {
+  db <- dbGetQuery(con, "SELECT player_id, name FROM players")
+  db$name_fl   <- sapply(strsplit(db$name, ", "),
+                         function(x) if (length(x) == 2) paste(x[2], x[1]) else x[1])
+  db$name_norm <- stri_trans_general(db$name_fl, "Latin-ASCII")
+  db
+}
+
+# ── Name overrides: CSV spelling → known player_id ───────────────────────────
+# Add new entries here whenever a CSV uses a nickname, shortened name, or typo
+# for a player who already exists in the DB.
+manual_overrides <- c(
+  "Samuel McIllhatton"    = 6005L,  # DB has "Sam"
+  "Jacob Rufe"            = 6011L,  # DB has "Jake"
+  "Daniel Trejo"          = 6006L,  # DB has "Danny"
+  "Preston Tabort Etaka"  = 6009L,  # name-part ordering differs in DB
+  "RamizHamouda"          = 6004L,  # missing space in source
+  "Axel Essenque"         = 6617L,  # typo variant of Axel Essengue
+  "Remi Cabral"           = 6702L,  # accent-stripped variant of Rémi Cabral
+  "Maximiliano Rodriguez" = 6685L,  # accent-stripped variant
+  "Morey Doner"           = 6425L   # duplicate row in source; 6425 has data
+)
+
+# ── Resolve a CSV player name to a player_id ─────────────────────────────────
+# Returns NA_integer_ if no unique match is found.
+lookup_player_id <- function(csv_name, lookup_df) {
+  # 1. Manual override
+  if (csv_name %in% names(manual_overrides)) {
+    id <- manual_overrides[[csv_name]]
+    if (!is.na(id)) return(id)
+  }
+  # 2. Exact accent-normalised match
+  norm <- stri_trans_general(csv_name, "Latin-ASCII")
+  m    <- lookup_df[lookup_df$name_norm == norm, ]
+  if (nrow(m) == 1) return(m$player_id)
+  # 3. Last-name-only fallback (only if unique)
+  last <- strsplit(norm, " ")[[1]]
+  last <- last[length(last)]
+  m2   <- lookup_df[grepl(last, lookup_df$name_norm, fixed = TRUE), ]
+  if (nrow(m2) == 1) return(m2$player_id)
+  NA_integer_
+}
+
+# ── Parse "M-D-YY" or "M-D-YYYY" date from a numbered CSV filename ───────────
+parse_snap_date <- function(fname) {
+  stem  <- sub("\\.csv$", "", basename(fname))
+  parts <- strsplit(stem, "_")[[1]]
+  bits  <- strsplit(parts[2], "-")[[1]]
+  yr    <- as.integer(bits[3])
+  if (yr < 100L) yr <- yr + 2000L
+  as.Date(sprintf("%04d-%02d-%02d", yr, as.integer(bits[1]), as.integer(bits[2])))
+}
+
+# ── Map Excel row-label → player_snaps column name ───────────────────────────
+stat_col_map <- c(
+  "Games played"                            = "games_played",
+  "Minutes played"                          = "mins_played",
+  "Starts"                                  = "starts",
+  "Subbed on"                               = "subbed_on",
+  "Subbed off"                              = "subbed_off",
+  "Goals conceded"                          = "goals_conceded",
+  "Saves"                                   = "saves",
+  "Catches"                                 = "catches",
+  "Punches"                                 = "punches",
+  "Goals"                                   = "goals",
+  "Penalties"                               = "penalties",
+  "Minutes per goal"                        = "mins_per_goal",
+  "Shots on target"                         = "shots_on_target",
+  "Shooting accuracy"                       = "shooting_accuracy",
+  "Successful crosses"                      = "successful_crosses",
+  "Crossing accuracy"                       = "crossing_accuracy",
+  "Assists"                                 = "assists",
+  "Key Passes"                              = "key_passes",
+  "Penalties won"                           = "penalties_won",
+  "Offsides"                                = "offsides",
+  "Tackles won"                             = "tackles_won",
+  "Tackles success rate"                    = "tackles_success_rate",
+  "Clearances"                              = "clearances",
+  "Blocks"                                  = "blocks",
+  "Interceptions"                           = "interceptions",
+  "Successful passes"                       = "successful_passes",
+  "Passing accuracy"                        = "passing_accuracy",
+  "Passing accuracy in opponents' half (%)" = "pass_accuracy_opp_half",
+  "Successful dribbles"                     = "successful_dribbles",
+  "Fouls won"                               = "fouls_won",
+  "Fouls conceded"                          = "fouls_conceded",
+  "Penalties conceded"                      = "penalties_conceded",
+  "Yellow cards"                            = "yellow_cards",
+  "Red cards"                               = "red_cards"
+)
+```
+
+---
+
+# 1 — Convert .xlsx to .csv
+
+Skip this section if your files are already in `.csv` format.
+
+```{r convert-xlsx}
+xlsx_files <- list.files(base, pattern = "\\.xlsx$", full.names = TRUE,
+                         recursive = TRUE)
+cat("Found", length(xlsx_files), ".xlsx files\n")
+
+converted <- 0L
+for (f in xlsx_files) {
+  csv_path <- sub("\\.xlsx$", ".csv", f)
+  if (!file.exists(csv_path)) {
+    df <- read_excel(f)
+    write.csv(df, csv_path, row.names = FALSE)
+    converted <- converted + 1L
+  }
+}
+cat("Converted", converted, "new files (skipped", length(xlsx_files) - converted,
+    "already-existing CSVs)\n")
+```
+
+---
+
+# 2 — Ingest Named CSVs
+
+These CSVs map directly to base tables: `matches`, `stadiums`, `teams`,
+`players`, `appearances`, `player_snaps` (pre-season export), and
+`season_team_stats`. New rows are inserted; existing rows are left unchanged.
+
+```{r ingest-named-matches}
+log_msg("--- matches ---")
+csv <- read_csv(paste0(base, "matches.csv"), show_col_types = FALSE)
+db  <- dbGetQuery(con, "SELECT match_id FROM matches")
+new <- csv[!csv$match_id %in% db$match_id, ]
+n   <- safe_insert(con, "matches", new)
+log_msg("matches: inserted", n, "new rows (DB had", nrow(db), ")")
+```
+
+```{r ingest-named-stadiums}
+log_msg("--- stadiums ---")
+csv <- read_csv(paste0(base, "stadiums.csv"), show_col_types = FALSE)
+db  <- dbGetQuery(con, "SELECT stadium_id FROM stadiums")
+new <- csv[!csv$stadium_id %in% db$stadium_id, ]
+n   <- safe_insert(con, "stadiums", new)
+log_msg("stadiums: inserted", n, "new rows (DB had", nrow(db), ")")
+```
+
+```{r ingest-named-teams}
+log_msg("--- teams ---")
+csv <- read_csv(paste0(base, "teams.csv"), show_col_types = FALSE)
+db  <- dbGetQuery(con, "SELECT team_id FROM teams")
+# 'stadium' in the CSV corresponds to stadium_id; extra columns are dropped
+new <- csv %>%
+  rename(stadium_id = stadium) %>%
+  select(team_id, name, city, abbreviation, conference, member_since, stadium_id) %>%
+  filter(!team_id %in% db$team_id)
+n <- safe_insert(con, "teams", new)
+log_msg("teams: inserted", n, "new rows (DB had", nrow(db), ")")
+```
+
+```{r ingest-named-players}
+log_msg("--- players ---")
+csv <- read_csv(paste0(base, "players.csv"), show_col_types = FALSE,
+                col_types = cols(dob = col_character()))
+db  <- dbGetQuery(con, "SELECT player_id FROM players")
+new <- csv %>%
+  filter(!is.na(name)) %>%                   # drop all-NA placeholder rows
+  filter(!player_id %in% db$player_id) %>%
+  select(player_id, name, dob, nation, position, dom_foot)
+n <- safe_insert(con, "players", new)
+log_msg("players: inserted", n, "new rows (DB had", nrow(db), ")")
+```
+
+```{r ingest-named-appearances}
+log_msg("--- appearances ---")
+csv <- read_csv(paste0(base, "appearances.csv"), show_col_types = FALSE)
+db  <- dbGetQuery(con, "SELECT match_id, player_id, team_id FROM appearances")
+new <- csv %>%
+  filter(!is.na(match_id), !is.na(player_id), !is.na(team_id)) %>%
+  anti_join(db, by = c("match_id", "player_id", "team_id"))
+n <- safe_insert(con, "appearances", new)
+log_msg("appearances: inserted", n, "new rows (DB had", nrow(db), ")")
+```
+
+```{r ingest-named-player-snaps}
+log_msg("--- player_snaps (pre-season CSV export) ---")
+csv <- read_csv(paste0(base, "player_snaps.csv"), show_col_types = FALSE)
+db  <- dbGetQuery(con, "SELECT snap_date, team_id, player_id FROM player_snaps")
+db$snap_date <- as.Date(db$snap_date)
+new <- csv %>%
+  rename(pass_accuracy_opp_half = passing_accuracy_in_opponents_half) %>%
+  filter(!is.na(player_id), !is.na(team_id)) %>%
+  anti_join(db, by = c("snap_date", "team_id", "player_id")) %>%
+  mutate(snapshot_id = NA_integer_)
+n <- safe_insert(con, "player_snaps", new)
+log_msg("player_snaps: inserted", n, "new rows (DB had", nrow(db), ")")
+```
+
+```{r ingest-named-season-team-stats}
+log_msg("--- season_team_stats ---")
+csv <- read_csv(paste0(base, "season_team_stats.csv"), show_col_types = FALSE)
+if (nrow(csv) > 0) {
+  new <- csv %>% rename(season = year)
+  n   <- safe_insert(con, "season_team_stats", new)
+  log_msg("season_team_stats: inserted", n, "rows")
+} else {
+  log_msg("season_team_stats: CSV is empty — nothing to import")
+}
+```
+
+---
+
+# 3 — Review New Player Names
+
+The numbered CSVs (`100_8-23-25.csv`, etc.) are wide-format per-team
+stat snapshots. Each column header is `"Player Name\nTeam Name"`. Before
+importing, we need every player name to resolve to a `player_id`.
+
+This section finds names that **cannot currently be matched** to any player
+in the DB. Review the table, then edit the exclusion list in the next chunk.
+
+## 3.1 Discover unmatched names
+
+```{r find-unmatched}
+numbered_files <- list.files(base, pattern = "^[0-9]+_[0-9].*\\.csv$",
+                             full.names = TRUE)
+cat("Numbered CSV files found:", length(numbered_files), "\n\n")
+
+name_lookup <- build_name_lookup(con)
+player_team_map <- list()   # csv_name → character vector of team labels
+
+for (fpath in numbered_files) {
+  df <- tryCatch(
+    read_csv(fpath, show_col_types = FALSE,
+             col_types = cols(.default = col_character())),
+    error = function(e) NULL
+  )
+  if (is.null(df) || ncol(df) < 2) next
+
+  for (pcol in names(df)[-1]) {
+    parts    <- strsplit(pcol, "\n")[[1]]
+    raw_name <- parts[1]
+    team_lbl <- if (length(parts) >= 2) parts[2] else NA_character_
+
+    # Skip Excel artifact names: "...N", numeric-only, or names ending in ...N
+    if (grepl("\\.\\.\\.\\d+", raw_name) || grepl("^[0-9.]+$", raw_name)) next
+
+    pid <- lookup_player_id(raw_name, name_lookup)
+    if (is.na(pid)) {
+      if (is.null(player_team_map[[raw_name]])) player_team_map[[raw_name]] <- character(0)
+      if (!is.na(team_lbl)) {
+        player_team_map[[raw_name]] <- unique(c(player_team_map[[raw_name]], team_lbl))
+      }
+    }
+  }
+}
+
+unmatched_df <- data.frame(
+  csv_name = names(player_team_map),
+  teams    = sapply(player_team_map, paste, collapse = "; "),
+  stringsAsFactors = FALSE
+) %>% arrange(csv_name)
+
+cat("Unmatched player names:", nrow(unmatched_df), "\n")
+```
+
+## 3.2 Inspect the unmatched names
+
+Review the table below. Each row is a player name from a snapshot CSV that
+does not match any existing `players` record. The `teams` column shows which
+team(s) the player appeared under across all files.
+
+```{r show-unmatched}
+if (nrow(unmatched_df) == 0) {
+  cat("All player names already matched. Nothing to add.\n")
+} else {
+  unmatched_df %>%
+    kable(
+      col.names = c("CSV Name", "Appeared Under Team(s)"),
+      caption   = paste("Unmatched player names —", nrow(unmatched_df), "total")
+    ) %>%
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width = FALSE
+    ) %>%
+    scroll_box(height = "400px")
+}
+```
+
+## 3.3 Exclude invalid names
+
+**Edit the vector below** before running it. Add any names from the table
+above that you do **not** want inserted into the `players` table. Common
+reasons to exclude:
+
+- The name looks like a data error (typo, test row, etc.)
+- It is a known alias that should be added to `manual_overrides` instead of
+  creating a new player record (e.g. "Sam" vs "Samuel" for an existing player)
+
+```{r set-exclusions}
+# ── EDIT THIS VECTOR ──────────────────────────────────────────────────────────
+# Add names exactly as they appear in the "CSV Name" column above.
+# Leave as character(0) to accept all unmatched names as new players.
+names_to_exclude <- character(0)
+
+# Example:
+# names_to_exclude <- c(
+#   "Test Player",          # obvious data error
+#   "J Smith"              # ambiguous — add manual_override instead
+# )
+# ─────────────────────────────────────────────────────────────────────────────
+
+approved_df <- unmatched_df %>%
+  filter(!csv_name %in% names_to_exclude)
+
+cat("Names approved for insertion:", nrow(approved_df), "\n")
+cat("Names excluded:              ", nrow(unmatched_df) - nrow(approved_df), "\n")
+
+if (length(names_to_exclude) > 0) {
+  cat("\nExcluded:\n")
+  for (nm in names_to_exclude) cat(" -", nm, "\n")
+}
+```
+
+---
+
+# 4 — Add Approved Players to the DB
+
+Converts each approved "First Last" name to "Last, First" format and inserts
+it into `players` with a new sequential `player_id`. All other fields (`dob`,
+`nation`, `position`, `dom_foot`) are left `NULL` — fill them in manually or
+via a future enrichment step.
+
+```{r add-new-players}
+if (nrow(approved_df) == 0) {
+  cat("No new players to add.\n")
+} else {
+  max_id  <- dbGetQuery(con, "SELECT MAX(player_id) AS m FROM players")$m
+  next_id <- max_id + 1L
+
+  new_players <- data.frame(
+    player_id = seq(next_id, next_id + nrow(approved_df) - 1L),
+    name      = sapply(approved_df$csv_name, to_last_first),
+    dob       = NA_character_,
+    nation    = NA_character_,
+    position  = NA_character_,
+    dom_foot  = NA_character_,
+    stringsAsFactors = FALSE
+  )
+  rownames(new_players) <- NULL
+
+  dbWriteTable(con, "players", new_players, append = TRUE)
+  log_msg("Inserted", nrow(new_players), "new players (IDs",
+          min(new_players$player_id), "to", max(new_players$player_id), ")")
+
+  new_players %>%
+    select(player_id, name) %>%
+    kable(col.names = c("New player_id", "Name (Last, First)"),
+          caption = "Players added to DB") %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+    scroll_box(height = "300px")
+}
+```
+
+> **After inserting**, rebuild the name lookup so the ingestion step below
+> picks up the new IDs.
+
+```{r rebuild-lookup}
+name_lookup <- build_name_lookup(con)
+cat("Name lookup rebuilt —", nrow(name_lookup), "players total\n")
+```
+
+---
+
+# 5 — Ingest Numbered Snapshot CSVs
+
+Registers each file in `raw_snapshots` (one row per file) and transforms the
+wide-format stat data into `player_snaps` rows (one row per player per date).
+
+```{r ingest-snapshots, results='hold'}
+existing_sources <- dbGetQuery(con, "SELECT source_file FROM raw_snapshots")$source_file
+
+snap_inserted   <- 0L
+ps_inserted     <- 0L
+ps_skipped_dup  <- 0L
+still_unmatched <- character(0)
+insert_errors   <- list()
+
+for (fpath in numbered_files) {
+  fname   <- basename(fpath)
+  stem    <- sub("\\.csv$", "", fname)
+  parts   <- strsplit(stem, "_")[[1]]
+  team_id <- as.integer(parts[1])
+  snap_date <- tryCatch(parse_snap_date(fname), error = function(e) NA)
+
+  if (is.na(snap_date)) {
+    log_msg("SKIP (bad date):", fname)
+    next
+  }
+
+  # ── Register in raw_snapshots ──────────────────────────────────────────────
+  if (!fname %in% existing_sources) {
+    dbExecute(con,
+      "INSERT INTO raw_snapshots (team_id, snap_date, source_file, ingested_at)
+       VALUES (?, ?, ?, ?)",
+      list(team_id, as.character(snap_date), fname,
+           format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
+    )
+    snap_inserted <- snap_inserted + 1L
+  }
+  snapshot_id <- dbGetQuery(
+    con,
+    "SELECT snapshot_id FROM raw_snapshots WHERE source_file = ?",
+    list(fname)
+  )$snapshot_id
+
+  # ── Parse wide → long ──────────────────────────────────────────────────────
+  df <- tryCatch(
+    read_csv(fpath, show_col_types = FALSE,
+             col_types = cols(.default = col_character())),
+    error = function(e) {
+      log_msg("ERROR reading", fname, ":", e$message)
+      NULL
+    }
+  )
+  if (is.null(df) || ncol(df) < 2) next
+
+  stat_names  <- df[[1]]
+  player_cols <- names(df)[-1]
+
+  for (pcol in player_cols) {
+    raw_name <- strsplit(pcol, "\n")[[1]][1]
+
+    # Skip artifact column names
+    if (grepl("\\.\\.\\.\\d+", raw_name) || grepl("^[0-9.]+$", raw_name)) next
+
+    player_id <- lookup_player_id(raw_name, name_lookup)
+    if (is.na(player_id)) {
+      still_unmatched <- unique(c(still_unmatched, raw_name))
+      next
+    }
+
+    # Check for existing row (avoid duplicates)
+    already <- dbGetQuery(
+      con,
+      "SELECT 1 FROM player_snaps WHERE snap_date=? AND team_id=? AND player_id=?",
+      list(as.character(snap_date), team_id, player_id)
+    )
+    if (nrow(already) > 0) {
+      ps_skipped_dup <- ps_skipped_dup + 1L
+      next
+    }
+
+    # Map stat row-labels → column names; deduplicate duplicate stat rows
+    vals        <- as.list(df[[pcol]])
+    names(vals) <- stat_col_map[stat_names]
+    vals        <- vals[!is.na(names(vals))]
+    vals        <- vals[!duplicated(names(vals))]
+
+    row_df <- as.data.frame(vals, stringsAsFactors = FALSE)
+    num_cols <- setdiff(names(row_df), c("snap_date", "team_id", "player_id", "snapshot_id"))
+    row_df[num_cols] <- lapply(row_df[num_cols],
+                               function(x) suppressWarnings(as.numeric(x)))
+    row_df$snap_date   <- as.character(snap_date)
+    row_df$team_id     <- team_id
+    row_df$player_id   <- player_id
+    row_df$snapshot_id <- snapshot_id
+
+    tryCatch(
+      { dbWriteTable(con, "player_snaps", row_df, append = TRUE)
+        ps_inserted <- ps_inserted + 1L },
+      error = function(e) {
+        insert_errors[[length(insert_errors) + 1]] <<-
+          paste0(raw_name, " in ", fname, ": ", e$message)
+      }
+    )
+  }
+}
+
+log_msg("raw_snapshots: inserted", snap_inserted, "new rows")
+log_msg("player_snaps:  inserted", ps_inserted, "new rows")
+log_msg("player_snaps:  skipped", ps_skipped_dup, "already-existing rows")
+```
+
+---
+
+# 6 — Audit
+
+## 6.1 Final row counts
+
+```{r audit-counts}
+tables_to_check <- c(
+  "matches", "stadiums", "teams", "players", "appearances",
+  "player_snaps", "season_team_stats", "raw_snapshots",
+  "season_rosters", "season_staff"
+)
+
+count_df <- data.frame(
+  table = tables_to_check,
+  rows  = sapply(tables_to_check, function(t) {
+    dbGetQuery(con, paste0("SELECT COUNT(*) AS n FROM ", t))$n
+  }),
+  stringsAsFactors = FALSE
+)
+
+count_df %>%
+  kable(col.names = c("Table", "Row Count"),
+        format.args = list(big.mark = ","),
+        caption = "DB row counts after ingestion") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 6.2 Still-unmatched player names
+
+Names that appeared in snapshot CSVs but could not be resolved to a
+`player_id` even after this run. If this list is non-empty, investigate
+whether each name needs a new player record or a `manual_overrides` entry.
+
+```{r audit-unmatched}
+if (length(still_unmatched) == 0) {
+  cat("All player names successfully matched.\n")
+} else {
+  cat(length(still_unmatched), "names still unresolved:\n\n")
+  data.frame(name = sort(still_unmatched)) %>%
+    kable(col.names = "Unresolved CSV Name",
+          caption = "Names with no matching player_id") %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+}
+```
+
+## 6.3 Insert errors
+
+Any rows that passed name-lookup but failed at the DB insert step.
+
+```{r audit-errors}
+if (length(insert_errors) == 0) {
+  cat("No insert errors.\n")
+} else {
+  cat(length(insert_errors), "insert error(s):\n\n")
+  for (e in insert_errors) cat(" !", e, "\n")
+}
+```
+
+## 6.4 Snapshot coverage
+
+How many distinct (team, date) snapshots are now in the DB, and which files
+are registered in `raw_snapshots`?
+
+```{r audit-coverage}
+dbGetQuery(con, "
+  SELECT rs.team_id, t.abbreviation AS team, rs.snap_date, rs.source_file
+  FROM raw_snapshots rs
+  LEFT JOIN teams t ON rs.team_id = t.team_id
+  ORDER BY rs.team_id, rs.snap_date
+") %>%
+  kable(caption = "Registered snapshot files") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+  scroll_box(height = "400px")
+```
+
+---
+
+# 7 — Cleanup
+
+```{r disconnect}
+dbDisconnect(con)
+cat("Connection closed.\n")
+```
+
+---
+
+# Appendix: Adding a manual override
+
+If a CSV uses a name variant for a player **already in the DB** (nickname,
+spelling error, missing accent, etc.) rather than adding a duplicate player
+record, add an entry to `manual_overrides` in the **Setup** chunk:
+
+```r
+manual_overrides <- c(
+  ...,
+  "CSV Spelling Here" = 1234L   # the existing player_id
+)
+```
+
+Then re-run from the **Setup** chunk onwards. The variant will be silently
+resolved at lookup time and no new player row will be created.
+
+---
+
+# Appendix: Updating `stat_col_map`
+
+If future snapshot exports add new stat rows, map them in `stat_col_map`
+inside the **Setup** chunk:
+
+```r
+stat_col_map <- c(
+  ...,
+  "New stat label in Excel" = "new_column_in_player_snaps"
+)
+```
+
+You will also need to `ALTER TABLE player_snaps ADD COLUMN new_column_in_player_snaps REAL;`
+in the database before re-running ingestion.
