@@ -46,9 +46,14 @@ public class USLExtractorGUI extends JFrame {
 
     private JLabel                    statusLabel;
     private JButton                   extractCurrentButton;
+    private JButton                   extractTeamBtn;
     private JSpinner                  mouseStepDelaySpinner, actionIntervalSpinner;
     private JComboBox<Database.Team>  teamComboBox;
     private DefaultListModel<Database.Player> playerListModel = new DefaultListModel<>();
+    private JList<Database.Player>    playerJList;
+
+    private Database.Player pivotGK  = null;
+    private JLabel          pivotGKLabel;
 
     private static final Dimension TUNE_BTN_SIZE = new Dimension(70, 26);
 
@@ -229,10 +234,22 @@ public class USLExtractorGUI extends JFrame {
         teamRow.add(teamComboBox);
 
         // ── Player roster list ────────────────────────────────────────────────
-        JList<Database.Player> playerJList = new JList<>(playerListModel);
+        playerJList = new JList<>(playerListModel);
         playerJList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         JScrollPane playerScroll = new JScrollPane(playerJList);
-        playerScroll.setBorder(BorderFactory.createTitledBorder("Roster"));
+
+        JButton moveUpBtn   = new JButton("▲");
+        JButton moveDownBtn = new JButton("▼");
+        moveUpBtn.addActionListener(e -> movePlayer(-1));
+        moveDownBtn.addActionListener(e -> movePlayer(1));
+        JPanel orderButtons = new JPanel(new GridLayout(2, 1, 0, 4));
+        orderButtons.add(moveUpBtn);
+        orderButtons.add(moveDownBtn);
+
+        JPanel rosterPanel = new JPanel(new BorderLayout(4, 0));
+        rosterPanel.setBorder(BorderFactory.createTitledBorder("Roster (drag ▲/▼ to reorder for Extract Team)"));
+        rosterPanel.add(playerScroll,  BorderLayout.CENTER);
+        rosterPanel.add(orderButtons,  BorderLayout.EAST);
 
         // Stack the top controls
         JPanel topStack = new JPanel();
@@ -241,8 +258,19 @@ public class USLExtractorGUI extends JFrame {
         topStack.add(Box.createVerticalStrut(6));
         topStack.add(teamRow);
 
-        tab.add(topStack,    BorderLayout.NORTH);
-        tab.add(playerScroll, BorderLayout.CENTER);
+        // ── Pivot GK selector ─────────────────────────────────────────────────
+        pivotGKLabel = new JLabel("None selected", SwingConstants.LEFT);
+        pivotGKLabel.setForeground(Color.GRAY);
+        JButton setPivotBtn = new JButton("Set from Selection");
+        setPivotBtn.addActionListener(e -> setPivotGK());
+        JPanel pivotGKPanel = new JPanel(new BorderLayout(6, 0));
+        pivotGKPanel.setBorder(BorderFactory.createTitledBorder("Pivot GK (always in stats table)"));
+        pivotGKPanel.add(pivotGKLabel, BorderLayout.CENTER);
+        pivotGKPanel.add(setPivotBtn,  BorderLayout.EAST);
+
+        tab.add(topStack,     BorderLayout.NORTH);
+        tab.add(rosterPanel,  BorderLayout.CENTER);
+        tab.add(pivotGKPanel, BorderLayout.SOUTH);
 
         return tab;
     }
@@ -299,12 +327,52 @@ public class USLExtractorGUI extends JFrame {
     /** Reload players for the currently selected team. */
     private void refreshPlayerList() {
         playerListModel.clear();
+        pivotGK = null;
+        if (pivotGKLabel != null) {
+            pivotGKLabel.setText("None selected");
+            pivotGKLabel.setForeground(Color.GRAY);
+        }
         Database.Team selected = (Database.Team) teamComboBox.getSelectedItem();
         if (selected == null || db == null) return;
         try {
             for (Database.Player p : db.getPlayersForTeam(selected.id))
                 playerListModel.addElement(p);
         } catch (SQLException ignored) {}
+        refreshExtractButton();
+    }
+
+    /** Move the selected roster player up (-1) or down (+1). */
+    private void movePlayer(int direction) {
+        int idx    = playerJList.getSelectedIndex();
+        int newIdx = idx + direction;
+        if (idx < 0 || newIdx < 0 || newIdx >= playerListModel.size()) return;
+        Database.Player p = playerListModel.remove(idx);
+        playerListModel.add(newIdx, p);
+        playerJList.setSelectedIndex(newIdx);
+    }
+
+    /**
+     * Returns the current roster order as an ordered list.
+     * Used by Extract Team sequence to determine player processing order.
+     */
+    private List<Database.Player> getRosterOrder() {
+        List<Database.Player> ordered = new ArrayList<>();
+        for (int i = 0; i < playerListModel.size(); i++)
+            ordered.add(playerListModel.getElementAt(i));
+        return ordered;
+    }
+
+    /** Mark the currently selected roster player as the Pivot GK. */
+    private void setPivotGK() {
+        Database.Player selected = playerJList.getSelectedValue();
+        if (selected == null) {
+            JOptionPane.showMessageDialog(this, "Select a player in the roster first.");
+            return;
+        }
+        pivotGK = selected;
+        pivotGKLabel.setText(pivotGK.toString());
+        pivotGKLabel.setForeground(new Color(0, 120, 0));
+        refreshExtractButton();
     }
 
     // -----------------------------------------------------------------------
@@ -316,14 +384,15 @@ public class USLExtractorGUI extends JFrame {
         p.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, Color.LIGHT_GRAY));
 
         extractCurrentButton = new JButton("Extract Current");
-        JButton extractTeamBtn   = new JButton("Extract Team");
+        extractTeamBtn       = new JButton("Extract Team");
         JButton extractLeagueBtn = new JButton("Extract League");
 
         extractCurrentButton.setEnabled(false);
-        extractTeamBtn.setEnabled(false);    // defined later
+        extractTeamBtn.setEnabled(false);
         extractLeagueBtn.setEnabled(false);  // defined later
 
         extractCurrentButton.addActionListener(e -> runExtract());
+        extractTeamBtn.addActionListener(e -> runExtractTeam());
 
         p.add(extractCurrentButton);
         p.add(extractTeamBtn);
@@ -646,8 +715,10 @@ public class USLExtractorGUI extends JFrame {
     }
 
     private void refreshExtractButton() {
-        extractCurrentButton.setEnabled(allPositionsSet());
-        if (allPositionsSet())
+        boolean pos = allPositionsSet();
+        extractCurrentButton.setEnabled(pos);
+        extractTeamBtn.setEnabled(pos && pivotGK != null);
+        if (pos)
             statusLabel.setText("All positions set. Click 'Extract Current' to run.");
     }
 
@@ -728,7 +799,7 @@ public class USLExtractorGUI extends JFrame {
     /**
      * Blocks the calling (non-EDT) thread with a modal dialog.
      * Returns true if the user clicks Continue / presses Enter.
-     * Returns false if the user clicks Exit / presses Escape  → caller calls System.exit(0).
+     * Returns false if the user clicks Cancel / presses Escape → caller ends the extraction sequence only.
      */
     private boolean waitForUserContinue() {
         final boolean[] proceed = {false};
@@ -742,13 +813,13 @@ public class USLExtractorGUI extends JFrame {
 
                 JLabel msg = new JLabel(
                     "<html>First paste complete.<br>" +
-                    "Press <b>Enter</b> to continue or <b>Escape</b> to exit the program.</html>",
+                    "Press <b>Enter</b> to continue or <b>Escape</b> to cancel extraction.</html>",
                     SwingConstants.CENTER);
                 dialog.add(msg, BorderLayout.CENTER);
 
                 JPanel btns = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 0));
                 JButton contBtn = new JButton("Continue");
-                JButton exitBtn = new JButton("Exit");
+                JButton exitBtn = new JButton("Cancel");
 
                 contBtn.addActionListener(e -> { proceed[0] = true;  dialog.dispose(); });
                 exitBtn.addActionListener(e -> { proceed[0] = false; dialog.dispose(); });
@@ -794,66 +865,14 @@ public class USLExtractorGUI extends JFrame {
         new Thread(() -> {
             try {
                 Robot r = new Robot();
-                Point cur = MouseInfo.getPointerInfo().getLocation();
-                int cx = cur.x, cy = cur.y;
-
-                // ── 1. Drag + Ctrl+C the initial table ───────────────────────────
-                int[] pos = dragCopyTable(r, cx, cy, stepDelay, interval);
-                cx = pos[0]; cy = pos[1];
-
-                // ── 2. Click Spreadsheet Target, Ctrl+V ──────────────────────────
-                smoothMouseMove(r, cx, cy, spreadsheetTargetPos.x, spreadsheetTargetPos.y, 30, stepDelay);
-                r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
-                r.delay(interval);
-                r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
-                r.delay(interval);
-                r.keyPress(KeyEvent.VK_CONTROL);
-                r.keyPress(KeyEvent.VK_V);
-                r.delay(interval);
-                r.keyRelease(KeyEvent.VK_V);
-                r.keyRelease(KeyEvent.VK_CONTROL);
-                r.delay(interval);
-                cx = spreadsheetTargetPos.x; cy = spreadsheetTargetPos.y;
-
-                // ── Pause: prompt user to confirm before continuing ───────────────
-                if (!waitForUserContinue()) {
-                    System.exit(0);
-                }
-
-                // ── 3–17. For each Stat Category tab ─────────────────────────────
-                for (int i = 0; i < statCategoryPos.length; i++) {
-                    pos = moveTo(r, cx, cy, statCategoryPos[i].x, statCategoryPos[i].y, stepDelay, interval);
-                    cx = pos[0]; cy = pos[1];
-
-                    copySelection(r, interval);
-
-                    pos = clickDownArrowsPaste(r, cx, cy, spreadsheetWindowPos,
-                                              STAT_DOWN_ARROWS[i], stepDelay, interval);
-                    cx = pos[0]; cy = pos[1];
-                }
-
-                // ── 18. Remove Players ───────────────────────────────────────────
-                smoothMouseMove(r, cx, cy, removePlayersPos[0].x, removePlayersPos[0].y, 30, stepDelay);
-                r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
-                r.delay(removeDelay);
-                r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
-                r.delay(removeDelay);
-
-                smoothMouseMove(r, removePlayersPos[0].x, removePlayersPos[0].y,
-                                   removePlayersPos[1].x, removePlayersPos[1].y, 30, stepDelay);
-                for (int i = 0; i < 4; i++) {
-                    r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
-                    r.delay(removeDelay);
-                    r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
-                    r.delay(removeDelay);
-                }
-
+                boolean completed = runExtractCurrentSequence(r, stepDelay, interval, removeDelay, true);
                 SwingUtilities.invokeLater(() -> {
-                    statusLabel.setText("Done. Click 'Extract Current' to run again.");
+                    statusLabel.setText(completed
+                        ? "Done. Click 'Extract Current' to run again."
+                        : "Extraction cancelled.");
                     extractCurrentButton.setEnabled(true);
                     setVisible(true);
                 });
-
             } catch (AWTException ex) {
                 SwingUtilities.invokeLater(() -> {
                     statusLabel.setText("Error: " + ex.getMessage());
@@ -862,6 +881,244 @@ public class USLExtractorGUI extends JFrame {
                 });
             }
         }).start();
+    }
+
+    /**
+     * Runs the full "Extract Current" mouse/keyboard automation sequence.
+     * Returns true if the sequence completed, false if the user cancelled at the mid-sequence prompt.
+     * Shared building block for Extract Team and Extract League sequences.
+     *
+     * @param showContinuePrompt  true for standalone Extract Current (shows mid-sequence dialog);
+     *                            false for automated callers like Extract Team/League.
+     */
+    private boolean runExtractCurrentSequence(Robot r, int stepDelay, int interval, int removeDelay,
+                                              boolean showContinuePrompt) {
+        Point cur = MouseInfo.getPointerInfo().getLocation();
+        int cx = cur.x, cy = cur.y;
+
+        // ── 1. Drag + Ctrl+C the initial table ───────────────────────────────
+        int[] pos = dragCopyTable(r, cx, cy, stepDelay, interval);
+        cx = pos[0]; cy = pos[1];
+
+        // ── 2. Click Spreadsheet Target, Ctrl+V ──────────────────────────────
+        smoothMouseMove(r, cx, cy, spreadsheetTargetPos.x, spreadsheetTargetPos.y, 30, stepDelay);
+        r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+        r.delay(interval);
+        r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+        r.delay(interval);
+        r.keyPress(KeyEvent.VK_CONTROL);
+        r.keyPress(KeyEvent.VK_V);
+        r.delay(interval);
+        r.keyRelease(KeyEvent.VK_V);
+        r.keyRelease(KeyEvent.VK_CONTROL);
+        r.delay(interval);
+        cx = spreadsheetTargetPos.x; cy = spreadsheetTargetPos.y;
+
+        // ── Pause: prompt user to confirm before continuing ───────────────────
+        if (showContinuePrompt && !waitForUserContinue()) {
+            return false;  // end extraction sequence only; program keeps running
+        }
+
+        // ── 3–17. For each Stat Category tab ─────────────────────────────────
+        for (int i = 0; i < statCategoryPos.length; i++) {
+            pos = moveTo(r, cx, cy, statCategoryPos[i].x, statCategoryPos[i].y, stepDelay, interval);
+            cx = pos[0]; cy = pos[1];
+
+            copySelection(r, interval);
+
+            pos = clickDownArrowsPaste(r, cx, cy, spreadsheetWindowPos,
+                                      STAT_DOWN_ARROWS[i], stepDelay, interval);
+            cx = pos[0]; cy = pos[1];
+        }
+
+        // ── After last paste: navigate to next player slot ────────────────────
+        for (int i = 0; i < 7; i++) {
+            r.keyPress(KeyEvent.VK_RIGHT);
+            r.keyRelease(KeyEvent.VK_RIGHT);
+            r.delay(50);
+        }
+        for (int i = 0; i < 34; i++) {
+            r.keyPress(KeyEvent.VK_UP);
+            r.keyRelease(KeyEvent.VK_UP);
+            r.delay(50);
+        }
+        r.delay(interval);
+
+        // ── 18. Remove Players ────────────────────────────────────────────────
+        smoothMouseMove(r, cx, cy, removePlayersPos[0].x, removePlayersPos[0].y, 30, stepDelay);
+        r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+        r.delay(removeDelay);
+        r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+        r.delay(removeDelay);
+
+        smoothMouseMove(r, removePlayersPos[0].x, removePlayersPos[0].y,
+                           removePlayersPos[1].x, removePlayersPos[1].y, 30, stepDelay);
+        for (int i = 0; i < 4; i++) {
+            r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+            r.delay(removeDelay);
+            r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+            r.delay(removeDelay);
+        }
+
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Robot helper: add one player via the Select Player dropdown
+    // -----------------------------------------------------------------------
+
+    /**
+     * Clicks the Select Player dropdown, navigates down by {@code downPresses} steps, and
+     * presses Enter to load that player into the stats table.
+     *
+     * Down-press count formula (0-based original roster index I, set of indices already in table T):
+     *   downPresses = I - |{t ∈ T : t < I}| + 1
+     *
+     * Because the site removes a player from the dropdown once they're in the table, each
+     * already-added player with a lower index shifts the target up by one slot; +1 converts
+     * from 0-based position to key-press count (one press lands on the first item).
+     */
+    private int[] addPlayerViaDropdown(Robot r, int fx, int fy, int downPresses, int stepDelay, int interval) {
+        smoothMouseMove(r, fx, fy, playerSelectPos.x, playerSelectPos.y, 30, stepDelay);
+        r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+        r.delay(interval);
+        r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+        r.delay(interval);
+        for (int i = 0; i < downPresses; i++) {
+            r.keyPress(KeyEvent.VK_DOWN);
+            r.keyRelease(KeyEvent.VK_DOWN);
+            r.delay(50);
+        }
+        r.keyPress(KeyEvent.VK_ENTER);
+        r.delay(interval);
+        r.keyRelease(KeyEvent.VK_ENTER);
+        r.delay(interval);
+        return new int[]{playerSelectPos.x, playerSelectPos.y};
+    }
+
+    // -----------------------------------------------------------------------
+    // Extract Team action
+    // -----------------------------------------------------------------------
+
+    private void runExtractTeam() {
+        if (!allPositionsSet() || pivotGK == null) {
+            JOptionPane.showMessageDialog(this,
+                "Please set all positions and select a Pivot GK before running Extract Team.");
+            return;
+        }
+
+        // Build the processing roster: all players except the pivot GK, in app-defined order.
+        // This order matches the website's Select Player dropdown order (pivot GK excluded
+        // because they are already in the stats table and therefore absent from the dropdown).
+        List<Database.Player> roster = new ArrayList<>();
+        for (Database.Player p : getRosterOrder()) {
+            if (p != pivotGK) roster.add(p);
+        }
+
+        if (roster.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Roster has no players other than the Pivot GK.");
+            return;
+        }
+
+        statusLabel.setText("Extract Team running…");
+        extractCurrentButton.setEnabled(false);
+        extractTeamBtn.setEnabled(false);
+        setVisible(false);
+
+        final int stepDelay   = (int) mouseStepDelaySpinner.getValue();
+        final int interval    = (int) actionIntervalSpinner.getValue();
+        final int removeDelay = Math.max(700, interval);
+        final List<Database.Player> finalRoster = roster;
+
+        new Thread(() -> {
+            try {
+                Robot r = new Robot();
+                boolean success = runExtractTeamSequence(r, finalRoster, stepDelay, interval, removeDelay);
+                SwingUtilities.invokeLater(() -> {
+                    statusLabel.setText(success ? "Extract Team complete." : "Extract Team cancelled.");
+                    refreshExtractButton();
+                    setVisible(true);
+                });
+            } catch (AWTException ex) {
+                SwingUtilities.invokeLater(() -> {
+                    statusLabel.setText("Error: " + ex.getMessage());
+                    refreshExtractButton();
+                    setVisible(true);
+                });
+            }
+        }).start();
+    }
+
+    /**
+     * Core Extract Team automation.
+     *
+     * Assumptions when called:
+     *   - The website's stats table contains only the pivot GK (no other players).
+     *   - The Select Player dropdown lists all non-pivot-GK players in the same order as
+     *     {@code roster} (which mirrors the app's roster list).
+     *
+     * Per-batch flow (batch size = 5 unique players):
+     *   1. Add 5 players to the stats table one at a time via the Select Player dropdown.
+     *      Each add is: click playerSelectPos → down N times → Enter.
+     *   2. Run Extract Current sequence (no continue prompt).
+     *   3. Repeat with the next 5 players.
+     *
+     * Last-batch padding: if fewer than 5 unique players remain, redundant players from the
+     * start of the roster are appended to fill the batch to exactly 5. This ensures the site
+     * always has a full table of 6 (pivot GK + 5) for a clean extraction.
+     *
+     * Down-press calculation: when adding a player whose 0-based original roster index is I,
+     * and the set of roster indices already in the table is T:
+     *   downPresses = I - |{t ∈ T : t < I}| + 1
+     * Players in T that have a lower index than I were removed from the dropdown, shifting I
+     * upward in the visible list; +1 converts 0-based position to key-press count.
+     */
+    private boolean runExtractTeamSequence(Robot r, List<Database.Player> roster,
+                                           int stepDelay, int interval, int removeDelay) {
+        final int BATCH_SIZE  = 5;
+        final int n           = roster.size();
+        final int numBatches  = (int) Math.ceil((double) n / BATCH_SIZE);
+
+        Point cur = MouseInfo.getPointerInfo().getLocation();
+        int cx = cur.x, cy = cur.y;
+
+        for (int batch = 0; batch < numBatches; batch++) {
+            int batchStart    = batch * BATCH_SIZE;
+            int batchEnd      = Math.min(batchStart + BATCH_SIZE, n);
+            int newCount      = batchEnd - batchStart;
+            int redundantCount = BATCH_SIZE - newCount;
+
+            // Build the ordered sequence of original roster indices to add for this batch.
+            // New (unique) players come first, then redundant fill players from the roster head.
+            List<Integer> toAdd = new ArrayList<>();
+            for (int i = batchStart; i < batchEnd; i++) toAdd.add(i);
+            for (int i = 0; i < redundantCount; i++)   toAdd.add(i);
+
+            // Track which roster indices are currently in the stats table (cleared each batch
+            // by Extract Current's Remove Players step).
+            Set<Integer> inTable = new LinkedHashSet<>();
+
+            // Add all 5 players for this batch, one dropdown interaction at a time.
+            for (int idx : toAdd) {
+                int countBelow = 0;
+                for (int t : inTable) if (t < idx) countBelow++;
+                int downPresses = idx - countBelow + 1;
+
+                int[] pos = addPlayerViaDropdown(r, cx, cy, downPresses, stepDelay, interval);
+                cx = pos[0]; cy = pos[1];
+                inTable.add(idx);
+            }
+
+            // Run Extract Current (no mid-sequence continue prompt for automated batches).
+            boolean completed = runExtractCurrentSequence(r, stepDelay, interval, removeDelay, false);
+            if (!completed) return false;
+
+            // After Extract Current, cursor ends near removePlayersPos[1].
+            cx = removePlayersPos[1].x;
+            cy = removePlayersPos[1].y;
+        }
+
+        return true;
     }
 
     // -----------------------------------------------------------------------

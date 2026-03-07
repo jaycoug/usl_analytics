@@ -1,0 +1,251 @@
+manage_db.py — Usage Guide
+==========================
+
+PURPOSE
+-------
+manage_db.py is a command-line script for adding and deleting players and teams
+in any USL analytics SQLite database. It handles foreign key dependencies
+automatically, so you don't have to worry about deletion order across tables.
+
+REQUIREMENTS
+------------
+- Python 3 (standard library only — no additional packages needed)
+- A SQLite database file with the standard USL analytics schema
+
+GENERAL SYNTAX
+--------------
+    python3 manage_db.py --db <path-to-db> <command> [options]
+
+--db is required for every command. All other options depend on the command.
+For built-in help on any command:
+
+    python3 manage_db.py --help
+    python3 manage_db.py <command> --help
+
+
+LOOKING UP IDs BEFORE YOU START
+--------------------------------
+Most write commands require player_id or team_id. Use the list commands first
+to find the right IDs.
+
+List all teams:
+    python3 manage_db.py --db usl_championship.db list-teams
+
+List all players on a team for a specific season:
+    python3 manage_db.py --db usl_championship.db list-players --team-id 5 --season 2025
+
+List all players across all seasons for a team:
+    python3 manage_db.py --db usl_championship.db list-players --team-id 5
+
+List every player in the database:
+    python3 manage_db.py --db usl_championship.db list-players
+
+
+COMMANDS
+--------
+
+1. add-player
+   Adds a new row to the players table. Optionally adds the player to a
+   season roster in the same operation.
+
+   Required:
+     --name       Player name. Use "Last, First" format to match existing data.
+
+   Optional player fields:
+     --position   Position abbreviation (e.g. GK, DEF, MID, FWD)
+     --dob        Date of birth in YYYY-MM-DD format
+     --nation     Nationality or country code
+     --dom-foot   Dominant foot: L or R
+
+   Optional roster fields (both required together if used):
+     --team-id    team_id of the team to roster the player on
+     --season     Season year (e.g. 2025)
+     --jersey     Jersey number
+
+   Examples:
+     # Add a player to the players table only
+     python3 manage_db.py --db usl_championship.db add-player \
+         --name "Smith, John" --position GK --dob 1998-04-15 --nation USA
+
+     # Add a player and immediately put them on a roster
+     python3 manage_db.py --db usl_championship.db add-player \
+         --name "Smith, John" --position GK --team-id 5 --season 2025 --jersey 1
+
+   Note: The player_id is assigned automatically by the database and printed
+   on success. Write it down if you need it for follow-up commands.
+
+
+2. delete-player
+   Deletes a player and cascades the deletion through all related tables:
+     - season_rosters (deleted)
+     - appearances (deleted)
+     - player_snaps (deleted)
+     - season_team_stats.top_scorer_id (set to NULL if it references this player)
+
+   Before deleting, the script prints a summary of how many rows will be
+   affected in each table and asks for confirmation.
+
+   Required:
+     --player-id   player_id of the player to delete
+
+   Options:
+     -y / --yes    Skip the confirmation prompt (use with caution)
+
+   Examples:
+     python3 manage_db.py --db usl_championship.db delete-player --player-id 42
+     python3 manage_db.py --db usl_championship.db delete-player --player-id 42 -y
+
+   WARNING: This permanently removes the player's entire history. If you only
+   want to remove them from one team's roster, use remove-roster instead.
+
+
+3. add-team
+   Adds a new row to the teams table.
+
+   Required:
+     --name         Full team name
+
+   Optional:
+     --city         City
+     --abbr         Abbreviation (e.g. LOU, TBF, CHA)
+     --conference   E or W
+     --member-since Year the team joined the league
+     --stadium-id   stadium_id from the stadiums table (must already exist)
+
+   Example:
+     python3 manage_db.py --db usl_championship.db add-team \
+         --name "Tampa Bay FC" --abbr TBF --city Tampa --conference W --member-since 2026
+
+   Note: The team_id is assigned automatically and printed on success.
+
+
+4. delete-team
+   Deletes a team and cascades through all related tables:
+     - season_rosters (deleted)
+     - appearances (deleted)
+     - player_snaps (deleted)
+     - raw_snapshots (deleted)
+     - season_team_stats (deleted)
+     - season_staff (deleted)
+     - matches: home_team_id and away_team_id set to NULL (match records preserved)
+
+   Before deleting, the script prints a row count for each affected table and
+   asks for confirmation.
+
+   Required:
+     --team-id   team_id of the team to delete
+
+   Options:
+     -y / --yes  Skip the confirmation prompt (use with caution)
+
+   Example:
+     python3 manage_db.py --db usl_championship.db delete-team --team-id 12
+
+   WARNING: This is highly destructive. All snap data, roster history, and
+   stat records for the team are permanently removed. Match records referencing
+   this team will have their team ID set to NULL rather than being deleted.
+
+
+5. add-roster
+   Adds an existing player (already in the players table) to a season roster.
+   Use this when a player changes teams mid-career or when populating a new
+   season's rosters.
+
+   Required:
+     --player-id   player_id
+     --team-id     team_id
+     --season      Season year
+
+   Optional:
+     --jersey      Jersey number
+     --captain     Flag to mark the player as team captain
+
+   Example:
+     python3 manage_db.py --db usl_championship.db add-roster \
+         --player-id 42 --team-id 5 --season 2026 --jersey 10 --captain
+
+
+6. remove-roster
+   Removes a player from a specific season roster only. The player's record
+   in the players table and any appearance/snap data are not affected.
+   Use this to correct a roster error or remove a player who left mid-season.
+
+   Required:
+     --player-id   player_id
+     --team-id     team_id
+     --season      Season year
+
+   Options:
+     -y / --yes    Skip the confirmation prompt
+
+   Example:
+     python3 manage_db.py --db usl_championship.db remove-roster \
+         --player-id 42 --team-id 5 --season 2025
+
+
+7. list-players
+   Displays a formatted table of players. Without filters, lists every player
+   in the database. With --team-id, shows only that team's rostered players
+   (with jersey numbers and seasons). Adding --season narrows to one season.
+
+   Options:
+     --team-id   Filter by team
+     --season    Filter by season (only valid combined with --team-id)
+
+   Examples:
+     python3 manage_db.py --db usl_championship.db list-players
+     python3 manage_db.py --db usl_championship.db list-players --team-id 5
+     python3 manage_db.py --db usl_championship.db list-players --team-id 5 --season 2025
+
+
+8. list-teams
+   Displays all teams with their team_id, name, abbreviation, city,
+   conference, and member_since year.
+
+   Example:
+     python3 manage_db.py --db usl_championship.db list-teams
+
+
+WORKING WITH A DIFFERENT DATABASE FILE
+---------------------------------------
+All commands accept any valid database file path via --db. The file must have
+the standard USL analytics schema (players, teams, season_rosters, etc.).
+
+    python3 manage_db.py --db /path/to/other_db.db list-teams
+
+
+COMMON WORKFLOWS
+----------------
+
+Adding a new player to a team at the start of a season:
+    1. python3 manage_db.py --db usl_championship.db list-teams
+       (find the team_id)
+    2. python3 manage_db.py --db usl_championship.db add-player \
+           --name "Doe, Jane" --position MID --team-id 5 --season 2026 --jersey 8
+
+Adding an existing player who transferred to a new team:
+    1. python3 manage_db.py --db usl_championship.db list-players
+       (find the player_id)
+    2. python3 manage_db.py --db usl_championship.db list-teams
+       (find the new team_id)
+    3. python3 manage_db.py --db usl_championship.db add-roster \
+           --player-id 42 --team-id 9 --season 2026 --jersey 14
+
+Correcting a roster error (wrong player added):
+    python3 manage_db.py --db usl_championship.db remove-roster \
+        --player-id 42 --team-id 5 --season 2025
+
+Removing a player who was entered by mistake (no real data attached):
+    python3 manage_db.py --db usl_championship.db delete-player --player-id 42
+
+
+NOTES
+-----
+- All deletions are permanent. SQLite has no recycle bin. Back up the .db
+  file before running any delete command if the data matters.
+- The script enables SQLite foreign key enforcement (PRAGMA foreign_keys = ON)
+  for every connection, which the database does not enforce by default.
+- All multi-step operations (e.g. add-player + roster entry) are wrapped in
+  a single transaction, so a partial failure leaves the database unchanged.
+- The players table expects names in "Last, First" format to be consistent
+  with existing data, but this is not enforced by the script or the database.
