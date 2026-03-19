@@ -126,6 +126,10 @@ public class Database {
                 }
             }
         }
+        list.sort(Comparator.comparing(p -> {
+            int sp = p.name == null ? -1 : p.name.lastIndexOf(' ');
+            return sp >= 0 ? p.name.substring(sp + 1) : (p.name == null ? "" : p.name);
+        }));
         return list;
     }
 

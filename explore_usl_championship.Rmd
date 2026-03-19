@@ -54,7 +54,7 @@ library(kableExtra)
 ```{r connect}
 # Update this path if your database file is in a different location.
 # If this .Rmd file is in the same folder as the .db file, the line below works as-is.
-db_path <- "usl_championship.db"
+db_path <- "usl_championship_26.db"
 
 con <- dbConnect(RSQLite::SQLite(), dbname = db_path)
 con

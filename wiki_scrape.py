@@ -25,10 +25,10 @@ import requests
 
 # Wikipedia URL for general info or info on a specific season.
 # Swap the URL as needed.
-WIKI_URL = "https://en.wikipedia.org/wiki/USL_Championship"
+WIKI_URL = "https://en.wikipedia.org/wiki/Miami_FC"
 
 # Path to your SQLite database (same folder as this script)
-DB_PATH = "usl_championship.db"
+DB_PATH = "usl_championship_26.db"
 
 # In command line, Use "wikipedia_scrape.py" for just previewing,
 # and "wikipedia_scrape.py --update" for updating.
@@ -40,7 +40,18 @@ UPDATE_MODE = "--update" in sys.argv
 
 # The season to update coaches for. Change this when a new
 # season starts so you're writing to the right year's records.
-CURRENT_SEASON = 2025
+CURRENT_SEASON = 2026
+
+# When targeting a specific team's Wikipedia page for roster ingestion,
+# set these to the team's abbreviation and full name as stored (or to
+# be stored) in the database.  Leave blank to use overview-page mode.
+TEAM_ABV  = "M"
+TEAM_NAME = "Miami FC"
+
+# Force a specific page mode: 'team', 'overview', or '' (auto-detect).
+# Use 'team' when the URL is a club page so navbox tables with a
+# 'Team' column don't trigger false overview detection.
+PAGE_MODE = "team"
 
 
 # ================================================================
@@ -122,28 +133,215 @@ for i, df in enumerate(tables):
         best_score = score
         best_index = i
 
-if best_index is None:
+# Detect squad tables (team-page mode: No. / Pos. / Player / Nation)
+SQUAD_KEYWORDS = {'no', 'pos', 'player', 'nation'}
+squad_table_indices = []
+for i, df in enumerate(tables):
+    col_set = {str(c).lower().strip().rstrip('.') for c in df.columns}
+    if len(col_set & SQUAD_KEYWORDS) >= 3:
+        squad_table_indices.append(i)
+
+if PAGE_MODE:
+    page_mode = PAGE_MODE
+    print(f"Page mode forced by config: '{page_mode}'")
+elif best_score >= 1:
+    page_mode = 'overview'
+elif squad_table_indices:
+    page_mode = 'team'
+    print(f"Team page detected — squad tables at indices: {squad_table_indices}")
+else:
     print("Could not auto-detect the teams/stadiums table.")
     print("Look at the table summaries above, pick the right index,")
     print("and set target_index manually in the script.")
     sys.exit(1)
 
-print(f"Best match: Table {best_index} (score: {best_score})")
-print("=" * 60)
+if page_mode == 'overview':
+    print(f"Best match: Table {best_index} (score: {best_score})")
+    print("=" * 60)
 
-wiki_df = tables[best_index]
+    wiki_df = tables[best_index]
 
-# Flatten multi-level column headers into simple strings
-if isinstance(wiki_df.columns, pd.MultiIndex):
-    wiki_df.columns = [' '.join(str(x) for x in col).strip() for col in wiki_df.columns]
+    # Flatten multi-level column headers into simple strings
+    if isinstance(wiki_df.columns, pd.MultiIndex):
+        wiki_df.columns = [' '.join(str(x) for x in col).strip() for col in wiki_df.columns]
 
-# Normalize column names to lowercase for easier matching
-wiki_df.columns = [str(c).lower().strip() for c in wiki_df.columns]
+    # Normalize column names to lowercase for easier matching
+    wiki_df.columns = [str(c).lower().strip() for c in wiki_df.columns]
 
-print(f"\nSelected table columns: {list(wiki_df.columns)}")
-print(f"\nFull table preview:")
-print(wiki_df.to_string())
-print()
+    print(f"\nSelected table columns: {list(wiki_df.columns)}")
+    print(f"\nFull table preview:")
+    print(wiki_df.to_string())
+    print()
+
+elif page_mode == 'team':
+    # ================================================================
+    # TEAM PAGE MODE: ROSTER INGESTION
+    # ================================================================
+    # Combine all detected squad tables, clean player names, and
+    # upsert into the players + season_rosters tables.
+    # ================================================================
+
+    import re
+
+    # ---- inline helpers (find_wiki_column not yet defined) ----------
+
+    def _find_col(df, candidates):
+        """Return first df column name matching any candidate as a whole word."""
+        for col in df.columns:
+            for term in candidates:
+                if re.search(r'\b' + re.escape(term) + r'\b', col, re.IGNORECASE):
+                    return col
+        return None
+
+    def _clean_name(raw):
+        """Strip loan notes and Wikipedia footnote refs from a player name."""
+        if pd.isna(raw):
+            return ""
+        s = str(raw).strip()
+        s = re.sub(r'\s*\(on loan from[^)]*\)', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'\s*\[.*?\]', '', s)
+        s = re.sub(r'\s*\(\s*\)', '', s)   # remove empty parens left after ref removal
+        return s.strip()
+
+    def _parse_jersey(raw):
+        """Return jersey number as int, or None for '—' / missing."""
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            return None
+        s = str(raw).strip()
+        if s in ('—', '-', ''):
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
+
+    # ---- Parse all squad tables ------------------------------------
+
+    print(f"Processing team page: {TEAM_NAME} ({TEAM_ABV})")
+    print(f"Squad tables at indices: {squad_table_indices}\n")
+
+    all_players = []
+    for idx in squad_table_indices:
+        df = tables[idx].copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [' '.join(str(x) for x in c).strip() for c in df.columns]
+        df.columns = [str(c).lower().strip().rstrip('.') for c in df.columns]
+
+        no_col     = _find_col(df, ['no'])
+        pos_col    = _find_col(df, ['pos'])
+        nation_col = _find_col(df, ['nation', 'nationality'])
+        player_col = _find_col(df, ['player', 'name'])
+
+        print(f"  Table {idx}: jersey={no_col!r}, pos={pos_col!r}, "
+              f"nation={nation_col!r}, player={player_col!r}")
+
+        for _, row in df.iterrows():
+            name = _clean_name(row.get(player_col, '') if player_col else '')
+            if not name:
+                continue
+            all_players.append({
+                'name':     name,
+                'jersey':   _parse_jersey(row.get(no_col) if no_col else None),
+                'position': (str(row.get(pos_col, '')).strip() if pos_col else '') or None,
+                'nation':   (str(row.get(nation_col, '')).strip() if nation_col else '') or None,
+            })
+
+    print(f"\nPlayers found: {len(all_players)}")
+    for p in all_players:
+        no_str = str(p['jersey']).rjust(2) if p['jersey'] is not None else ' —'
+        print(f"  #{no_str}  {p['position'] or '??'}  {p['nation'] or '???'}  {p['name']}")
+
+    # ---- Connect and ensure team exists ----------------------------
+
+    print(f"\n{'=' * 60}")
+    conn_t = sqlite3.connect(DB_PATH)
+    cur_t  = conn_t.cursor()
+
+    cur_t.execute("SELECT team_abv FROM teams WHERE team_abv = ?", (TEAM_ABV,))
+    team_exists = cur_t.fetchone() is not None
+
+    if not team_exists:
+        if UPDATE_MODE:
+            cur_t.execute("PRAGMA foreign_keys = ON;")
+            cur_t.execute("SELECT COALESCE(MAX(stadium_id), 0) FROM stadiums")
+            sid = cur_t.fetchone()[0] + 1
+            cur_t.execute(
+                "INSERT INTO stadiums (stadium_id, name) VALUES (?, ?)",
+                (sid, f"{TEAM_NAME} Stadium (placeholder)")
+            )
+            cur_t.execute(
+                "INSERT INTO teams (team_abv, name, stadium_id) VALUES (?, ?, ?)",
+                (TEAM_ABV, TEAM_NAME, sid)
+            )
+            print(f"Inserted team '{TEAM_NAME}' ({TEAM_ABV}) with placeholder stadium (id={sid}).")
+        else:
+            print(f"NOTE: Team '{TEAM_NAME}' ({TEAM_ABV}) not in DB — will be inserted on --update.")
+
+    # ---- Preview or apply ------------------------------------------
+
+    if not UPDATE_MODE:
+        print(f"\nPREVIEW MODE — {len(all_players)} players would be ingested "
+              f"for {TEAM_NAME} season {CURRENT_SEASON}.")
+        print(f"Run with --update to apply:  python wiki_scrape.py --update")
+        conn_t.close()
+        sys.exit(0)
+
+    cur_t.execute("PRAGMA foreign_keys = ON;")
+    new_players   = 0
+    roster_inserts = 0
+    roster_updates = 0
+
+    for p in all_players:
+        cur_t.execute("SELECT player_id FROM players WHERE name = ?", (p['name'],))
+        row = cur_t.fetchone()
+        if row:
+            player_id = row[0]
+            # Fill in missing nation / position if we have them now
+            if p['nation']:
+                cur_t.execute(
+                    "UPDATE players SET nation = ? WHERE player_id = ? AND nation IS NULL",
+                    (p['nation'], player_id)
+                )
+            if p['position']:
+                cur_t.execute(
+                    "UPDATE players SET position = ? WHERE player_id = ? AND position IS NULL",
+                    (p['position'], player_id)
+                )
+        else:
+            cur_t.execute(
+                "INSERT INTO players (name, nation, position) VALUES (?, ?, ?)",
+                (p['name'], p['nation'], p['position'])
+            )
+            player_id = cur_t.lastrowid
+            new_players += 1
+
+        cur_t.execute(
+            "SELECT jersey_number FROM season_rosters "
+            "WHERE season = ? AND team_abv = ? AND player_id = ?",
+            (CURRENT_SEASON, TEAM_ABV, player_id)
+        )
+        existing = cur_t.fetchone()
+        if existing is None:
+            cur_t.execute(
+                "INSERT INTO season_rosters (season, team_abv, player_id, jersey_number) "
+                "VALUES (?, ?, ?, ?)",
+                (CURRENT_SEASON, TEAM_ABV, player_id, p['jersey'])
+            )
+            roster_inserts += 1
+        else:
+            cur_t.execute(
+                "UPDATE season_rosters SET jersey_number = ? "
+                "WHERE season = ? AND team_abv = ? AND player_id = ?",
+                (p['jersey'], CURRENT_SEASON, TEAM_ABV, player_id)
+            )
+            roster_updates += 1
+
+    conn_t.commit()
+    print(f"✓ Players: {new_players} inserted.")
+    print(f"✓ Roster rows: {roster_inserts} inserted, {roster_updates} updated.")
+    print(f"✓ {TEAM_NAME} ({TEAM_ABV}) roster for {CURRENT_SEASON} written to {DB_PATH}.")
+    conn_t.close()
+    sys.exit(0)
 
 
 # ================================================================
@@ -161,16 +359,18 @@ print("=" * 60)
 conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
-# Pull existing teams and stadiums
+# Pull existing teams and stadiums.
+# LEFT JOIN so teams without a stadium yet are still included.
 cursor.execute("""
-    SELECT t.team_id, t.name, t.city, t.stadium_id,
-           s.name as stadium_name, s.capacity, s.surface
+    SELECT t.team_abv, t.name, t.city, t.conference, t.stadium_id,
+           s.name as stadium_name, s.capacity, s.surface,
+           t.kit_manufacturer, t.kit_sponsor
     FROM teams t
-    JOIN stadiums s ON t.stadium_id = s.stadium_id
+    LEFT JOIN stadiums s ON t.stadium_id = s.stadium_id
 """)
 db_teams = cursor.fetchall()
-col_names_db = ['team_id', 'team_name', 'city', 'stadium_id',
-                'stadium_name', 'capacity', 'surface']
+col_names_db = ['team_abv', 'team_name', 'city', 'conference', 'stadium_id',
+                'stadium_name', 'capacity', 'surface', 'kit_manufacturer', 'kit_sponsor']
 
 print(f"\nDatabase has {len(db_teams)} teams.")
 print(f"Wikipedia table has {len(wiki_df)} rows.\n")
@@ -203,10 +403,20 @@ def clean_wiki_text(text):
 # Try to detect which Wikipedia columns map to what we need.
 # This is heuristic — we look for columns containing key terms.
 def find_wiki_column(df, candidates):
-    """Find the first column name containing any of the candidate terms."""
+    """Find the first column name matching any candidate term.
+
+    First pass: whole-word match (e.g. 'Team' matches 'Team').
+    Second pass: startswith match to catch Wikipedia template suffixes
+    like 'Teamvte' (the vte view/talk/edit marker appended by MediaWiki).
+    """
+    import re as _re
     for col in df.columns:
         for term in candidates:
-            if term in col:
+            if _re.search(r'\b' + _re.escape(term) + r'\b', col, _re.IGNORECASE):
+                return col
+    for col in df.columns:
+        for term in candidates:
+            if str(col).lower().startswith(term.lower()):
                 return col
     return None
 
@@ -241,6 +451,96 @@ if wiki_team_col is None:
 
 
 # ================================================================
+# PHASE 3.5: BUILD CONFERENCE MAP AND PERSONNEL MAP
+# ================================================================
+# Conference map: parse the page HTML to find which heading
+# (Eastern Conference / Western Conference) precedes each standings
+# table, then record every team name in that table as E or W.
+#
+# Personnel map: separately detect the table that has coach/captain
+# columns and build a lookup keyed by normalized team name.
+
+from bs4 import BeautifulSoup
+
+conference_map = {}   # normalize(team_name) → 'E' or 'W'
+soup = BeautifulSoup(response.text, 'lxml')
+
+# Walk all elements in document order, tracking the most recent
+# conference heading so each table is stamped with the right value.
+current_conf = None
+for elem in soup.find_all(['h2', 'h3', 'table']):
+    if elem.name in ('h2', 'h3'):
+        text = elem.get_text(strip=True).lower()
+        if 'eastern' in text:
+            current_conf = 'E'
+        elif 'western' in text:
+            current_conf = 'W'
+        elif elem.name == 'h2':
+            current_conf = None   # top-level section reset
+    elif elem.name == 'table' and current_conf:
+        try:
+            conf_df = pd.read_html(str(elem))[0]
+            if isinstance(conf_df.columns, pd.MultiIndex):
+                conf_df.columns = [' '.join(str(x) for x in c).strip() for c in conf_df.columns]
+            conf_df.columns = [str(c).lower().strip() for c in conf_df.columns]
+            t_col = find_wiki_column(conf_df, ['team', 'club'])
+            if t_col:
+                for name in conf_df[t_col]:
+                    conference_map[normalize(str(name))] = current_conf
+        except Exception:
+            pass
+
+print(f"Conference map: {len(conference_map)} teams detected")
+for name, conf in sorted(conference_map.items()):
+    print(f"  {name}: {conf}")
+print()
+
+# Personnel map: find the table with coach/captain columns.
+personnel_map = {}   # normalize(team_name) → {'coach': ..., 'captain': ...}
+
+PERSONNEL_KEYWORDS = {'coach', 'manager', 'captain', 'sponsor', 'manufacturer'}
+for i, df in enumerate(tables):
+    col_set = {str(c).lower().strip() for c in df.columns}
+    # Use substring matching — column names like 'head coach' and
+    # 'captain(s)' won't hit an exact set intersection.
+    has_personnel = any(any(kw in col for kw in PERSONNEL_KEYWORDS) for col in col_set)
+    has_team = any('team' in c or 'club' in c for c in col_set)
+    if has_personnel and has_team:
+        pers_df = df.copy()
+        if isinstance(pers_df.columns, pd.MultiIndex):
+            pers_df.columns = [' '.join(str(x) for x in c).strip() for c in pers_df.columns]
+        pers_df.columns = [str(c).lower().strip() for c in pers_df.columns]
+
+        pers_team_col    = find_wiki_column(pers_df, ['team', 'club'])
+        pers_coach_col   = find_wiki_column(pers_df, ['head coach', 'coach', 'manager'])
+        pers_captain_col = find_wiki_column(pers_df, ['captain'])
+        pers_kit_mfr_col = find_wiki_column(pers_df, ['kit manufacturer', 'manufacturer'])
+        pers_kit_spo_col = find_wiki_column(pers_df, ['kit sponsor', 'sponsor'])
+
+        print(f"Personnel table: Table {i}")
+        print(f"  Team: {pers_team_col}  Coach: {pers_coach_col}  Captain: {pers_captain_col}")
+        print(f"  Kit manufacturer: {pers_kit_mfr_col}  Kit sponsor: {pers_kit_spo_col}")
+
+        for _, row in pers_df.iterrows():
+            t_name = str(row.get(pers_team_col, ''))
+            t_norm = normalize(t_name)
+            if not t_norm:
+                continue
+            personnel_map[t_norm] = {
+                'coach':            clean_wiki_text(row.get(pers_coach_col,   '')) if pers_coach_col   else '',
+                'captain':          clean_wiki_text(row.get(pers_captain_col, '')) if pers_captain_col else '',
+                'kit_manufacturer': clean_wiki_text(row.get(pers_kit_mfr_col, '')) if pers_kit_mfr_col else '',
+                'kit_sponsor':      clean_wiki_text(row.get(pers_kit_spo_col, '')) if pers_kit_spo_col else '',
+            }
+        print(f"  Built personnel map for {len(personnel_map)} teams")
+        print()
+        break  # only need the first matching table
+else:
+    print("No personnel table found.")
+    print()
+
+
+# ================================================================
 # PHASE 4: COMPARE AND GENERATE UPDATES
 # ================================================================
 
@@ -249,13 +549,14 @@ new_teams = []     # Track new teams for the summary
 match_count = 0
 miss_count = 0
 
-# Pre-fetch the next available IDs for new teams/stadiums.
-# We query the current max and will increment from there.
-cursor.execute("SELECT COALESCE(MAX(team_id), 99) FROM teams")
-next_team_id = cursor.fetchone()[0] + 1
-
-cursor.execute("SELECT COALESCE(MAX(stadium_id), 29) FROM stadiums")
+# Pre-fetch the next available stadium_id.
+cursor.execute("SELECT COALESCE(MAX(stadium_id), 0) FROM stadiums")
 next_stadium_id = cursor.fetchone()[0] + 1
+
+# Pre-load all existing abbreviations so new ones don't collide.
+# We add to this set as we generate abbrevs in the loop below.
+cursor.execute("SELECT team_abv FROM teams")
+used_abbrevs = {row[0] for row in cursor.fetchall()}
 
 for _, wiki_row in wiki_df.iterrows():
     wiki_name = str(wiki_row.get(wiki_team_col, ''))
@@ -296,27 +597,19 @@ for _, wiki_row in wiki_df.iterrows():
         wiki_name_clean = clean_wiki_text(wiki_name)
 
         # Parse what we can from the Wikipedia row
-        new_city = clean_wiki_text(wiki_row.get(wiki_city_col, '')) if wiki_city_col else ''
         new_stadium_name = clean_wiki_text(wiki_row.get(wiki_stadium_col, '')) if wiki_stadium_col else ''
-        new_coach = clean_wiki_text(wiki_row.get(wiki_coach_col, '')) if wiki_coach_col else ''
 
-        # Parse capacity (digits only)
+        # Parse capacity (digits only — take the first run of 4+ digits
+        # to avoid grabbing footnote numbers like [186])
         new_capacity = None
         if wiki_capacity_col and pd.notna(wiki_row.get(wiki_capacity_col)):
-            cap_digits = ''.join(c for c in str(wiki_row[wiki_capacity_col]) if c.isdigit())
-            if cap_digits:
-                new_capacity = int(cap_digits)
+            import re as _re
+            cap_match = _re.search(r'\d{4,}', str(wiki_row[wiki_capacity_col]).replace(',', ''))
+            if cap_match:
+                new_capacity = int(cap_match.group())
 
-        # Determine conference from the Wikipedia row.
-        # The Wikipedia table often has a "Conference" column with
-        # values like "Eastern Conference" or "Western Conference".
-        new_conference = None
-        if wiki_conference_col and pd.notna(wiki_row.get(wiki_conference_col)):
-            conf_raw = str(wiki_row[wiki_conference_col]).lower()
-            if 'east' in conf_raw:
-                new_conference = 'E'
-            elif 'west' in conf_raw:
-                new_conference = 'W'
+        # Conference from the heading-based map built in Phase 3.5
+        new_conference = conference_map.get(wiki_name_norm)
 
         # Parse the "joined" year (when they enter the league)
         new_joined = None
@@ -326,41 +619,67 @@ for _, wiki_row in wiki_df.iterrows():
             if len(joined_digits) >= 4:
                 new_joined = int(joined_digits[:4])
 
-        # Abbreviation can't be reliably scraped — we'll leave it
-        # blank and flag it for manual entry.
-        new_abbr = ''
+        # Coach, captain, and kit info from the personnel map built in Phase 3.5
+        pers = personnel_map.get(wiki_name_norm, {})
+        new_coach        = pers.get('coach', '')
+        new_captain      = pers.get('captain', '')
+        new_kit_mfr      = pers.get('kit_manufacturer', '')
+        new_kit_sponsor  = pers.get('kit_sponsor', '')
 
-        # Assign IDs
+        # Derive a placeholder abbreviation from the team name initials.
+        # team_abv is the primary key so it must be unique and non-empty.
+        # Review and correct these after the run — they are placeholders.
+        import re as _re
+        words = _re.sub(r'[^a-zA-Z\s]', '', wiki_name_clean).split()
+        stop = {'fc', 'sc', 'cf', 'ac', 'united', 'city', 'the'}
+        sig = [w for w in words if w.lower() not in stop] or words
+        base_abbr = ''.join(w[0].upper() for w in sig[:4])
+        new_abbr = base_abbr
+        suffix = 2
+        while new_abbr in used_abbrevs:
+            new_abbr = base_abbr + str(suffix)
+            suffix += 1
+        used_abbrevs.add(new_abbr)
+
+        # Assign stadium ID
         sid = next_stadium_id
-        tid = next_team_id
         next_stadium_id += 1
-        next_team_id += 1
 
         print(f"  ★ NEW TEAM: '{wiki_name_clean}'")
-        print(f"      team_id={tid}, stadium_id={sid}")
-        print(f"      City: {new_city}")
+        print(f"      team_abv={new_abbr} (derived placeholder), stadium_id={sid}")
         print(f"      Stadium: {new_stadium_name} (capacity: {new_capacity})")
         print(f"      Conference: {new_conference}")
         print(f"      Joined: {new_joined}")
         print(f"      Coach: {new_coach}")
-        print(f"      ⚠ Abbreviation left blank — set manually later")
+        print(f"      Captain: {new_captain if new_captain else '(none listed)'}")
+        print(f"      Kit manufacturer: {new_kit_mfr if new_kit_mfr else '(none listed)'}")
+        print(f"      Kit sponsor: {new_kit_sponsor if new_kit_sponsor else '(none listed)'}")
+        print(f"      ⚠ team_abv is a derived placeholder — update manually before referencing")
 
-        # Stadium INSERT must come before team INSERT (foreign key)
+        # Stadium INSERT must come before team INSERT (foreign key).
+        # City and surface are not available on this page — left NULL.
         updates.append((
-            "INSERT INTO stadiums (stadium_id, name, city, capacity, surface) VALUES (?, ?, ?, ?, ?)",
-            (sid, new_stadium_name, new_city, new_capacity, None)
+            "INSERT INTO stadiums (stadium_id, name, capacity) VALUES (?, ?, ?)",
+            (sid, new_stadium_name, new_capacity)
         ))
 
         updates.append((
-            "INSERT INTO teams (team_id, name, city, abbreviation, conference, member_since, stadium_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (tid, wiki_name_clean, new_city, new_abbr, new_conference, new_joined, sid)
+            "INSERT INTO teams (team_abv, name, conference, member_since, stadium_id, kit_manufacturer, kit_sponsor) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (new_abbr, wiki_name_clean, new_conference, new_joined, sid, new_kit_mfr or None, new_kit_sponsor or None)
         ))
 
-        # Also add the coach to season_staff if we have one
         if new_coach:
             updates.append((
-                "INSERT INTO season_staff (season, team_id, role, name) VALUES (?, ?, ?, ?)",
-                (CURRENT_SEASON, tid, 'Head Coach', new_coach)
+                "INSERT INTO season_staff (season, team_abv, role, name) VALUES (?, ?, ?, ?)",
+                (CURRENT_SEASON, new_abbr, 'Head Coach', new_coach)
+            ))
+
+        # Captain stored in season_staff; player FK resolved later
+        # when rosters are loaded.
+        if new_captain:
+            updates.append((
+                "INSERT INTO season_staff (season, team_abv, role, name) VALUES (?, ?, ?, ?)",
+                (CURRENT_SEASON, new_abbr, 'Captain', new_captain)
             ))
 
         new_teams.append(wiki_name_clean)
@@ -371,9 +690,9 @@ for _, wiki_row in wiki_df.iterrows():
     # MATCHED ROWS → CHECK FOR UPDATES
     # ==============================================================
     match_count += 1
-    team_id = matched_team['team_id']
+    team_abv = matched_team['team_abv']
     stadium_id = matched_team['stadium_id']
-    label = f"{matched_team['team_name']} ({team_id})"
+    label = f"{matched_team['team_name']} ({team_abv})"
 
     # --- Check capacity ---
     if wiki_capacity_col and pd.notna(wiki_row.get(wiki_capacity_col)):
@@ -413,34 +732,56 @@ for _, wiki_row in wiki_df.iterrows():
                 (new_stadium, stadium_id)
             ))
 
-    # --- Check head coach ---
-    # Query the current coach from season_staff for this team.
-    # If the Wikipedia coach differs, generate an update.
-    if wiki_coach_col and pd.notna(wiki_row.get(wiki_coach_col)):
-        new_coach = clean_wiki_text(wiki_row[wiki_coach_col])
+    # --- Check head coach, captain, and kit info (from personnel_map) ---
+    pers = personnel_map.get(wiki_name_norm, {})
+    new_coach       = pers.get('coach', '')
+    new_captain     = pers.get('captain', '')
+    new_kit_mfr     = pers.get('kit_manufacturer', '')
+    new_kit_sponsor = pers.get('kit_sponsor', '')
 
-        if new_coach:
-            cursor.execute(
-                "SELECT name FROM season_staff WHERE team_id = ? AND season = ? AND role = 'Head Coach'",
-                (team_id, CURRENT_SEASON)
-            )
-            result = cursor.fetchone()
-            old_coach = result[0] if result else None
+    for role, new_name in [('Head Coach', new_coach), ('Captain', new_captain)]:
+        if not new_name:
+            continue
+        cursor.execute(
+            "SELECT name FROM season_staff WHERE team_abv = ? AND season = ? AND role = ?",
+            (team_abv, CURRENT_SEASON, role)
+        )
+        result = cursor.fetchone()
+        old_name = result[0] if result else None
 
-            if old_coach is None:
-                # No coach record exists yet — insert one
-                print(f"  {label}: coach (empty) → {new_coach}")
-                updates.append((
-                    "INSERT INTO season_staff (season, team_id, role, name) VALUES (?, ?, ?, ?)",
-                    (CURRENT_SEASON, team_id, 'Head Coach', new_coach)
-                ))
-            elif normalize(old_coach) != normalize(new_coach):
-                # Coach has changed — update the existing record
-                print(f"  {label}: coach '{old_coach}' → '{new_coach}'")
-                updates.append((
-                    "UPDATE season_staff SET name = ? WHERE team_id = ? AND season = ? AND role = 'Head Coach'",
-                    (new_coach, team_id, CURRENT_SEASON)
-                ))
+        if old_name is None:
+            print(f"  {label}: {role} (empty) → {new_name}")
+            updates.append((
+                "INSERT INTO season_staff (season, team_abv, role, name) VALUES (?, ?, ?, ?)",
+                (CURRENT_SEASON, team_abv, role, new_name)
+            ))
+        elif normalize(old_name) != normalize(new_name):
+            print(f"  {label}: {role} '{old_name}' → {new_name}")
+            updates.append((
+                "UPDATE season_staff SET name = ? WHERE team_abv = ? AND season = ? AND role = ?",
+                (new_name, team_abv, CURRENT_SEASON, role)
+            ))
+
+    # --- Check conference ---
+    new_conf = conference_map.get(wiki_name_norm)
+    if new_conf and matched_team.get('conference') != new_conf:
+        print(f"  {label}: conference → {new_conf}")
+        updates.append((
+            "UPDATE teams SET conference = ? WHERE team_abv = ?",
+            (new_conf, team_abv)
+        ))
+
+    # --- Check kit manufacturer and sponsor ---
+    for col, new_val in [('kit_manufacturer', new_kit_mfr), ('kit_sponsor', new_kit_sponsor)]:
+        if not new_val:
+            continue
+        old_val = matched_team.get(col)
+        if old_val != new_val:
+            print(f"  {label}: {col} '{old_val}' → '{new_val}'")
+            updates.append((
+                f"UPDATE teams SET {col} = ? WHERE team_abv = ?",
+                (new_val, team_abv)
+            ))
 
 
 # ================================================================

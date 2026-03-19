@@ -865,7 +865,7 @@ public class USLExtractorGUI extends JFrame {
         new Thread(() -> {
             try {
                 Robot r = new Robot();
-                boolean completed = runExtractCurrentSequence(r, stepDelay, interval, removeDelay, true);
+                boolean completed = runExtractCurrentSequence(r, stepDelay, interval, removeDelay, true, true);
                 SwingUtilities.invokeLater(() -> {
                     statusLabel.setText(completed
                         ? "Done. Click 'Extract Current' to run again."
@@ -892,7 +892,7 @@ public class USLExtractorGUI extends JFrame {
      *                            false for automated callers like Extract Team/League.
      */
     private boolean runExtractCurrentSequence(Robot r, int stepDelay, int interval, int removeDelay,
-                                              boolean showContinuePrompt) {
+                                              boolean showContinuePrompt, boolean clickTarget) {
         Point cur = MouseInfo.getPointerInfo().getLocation();
         int cx = cur.x, cy = cur.y;
 
@@ -900,8 +900,13 @@ public class USLExtractorGUI extends JFrame {
         int[] pos = dragCopyTable(r, cx, cy, stepDelay, interval);
         cx = pos[0]; cy = pos[1];
 
-        // ── 2. Click Spreadsheet Target, Ctrl+V ──────────────────────────────
-        smoothMouseMove(r, cx, cy, spreadsheetTargetPos.x, spreadsheetTargetPos.y, 30, stepDelay);
+        // ── 2. Click spreadsheet focus point, Ctrl+V ─────────────────────────
+        // First iteration: click the target cell directly.
+        // Subsequent iterations: the cell is already in position from the previous
+        // iteration's right/up-arrow adjustment, so click the window title bar
+        // instead to regain focus without disturbing the active cell.
+        Point focusPoint = clickTarget ? spreadsheetTargetPos : spreadsheetWindowPos;
+        smoothMouseMove(r, cx, cy, focusPoint.x, focusPoint.y, 30, stepDelay);
         r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
         r.delay(interval);
         r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
@@ -912,7 +917,7 @@ public class USLExtractorGUI extends JFrame {
         r.keyRelease(KeyEvent.VK_V);
         r.keyRelease(KeyEvent.VK_CONTROL);
         r.delay(interval);
-        cx = spreadsheetTargetPos.x; cy = spreadsheetTargetPos.y;
+        cx = focusPoint.x; cy = focusPoint.y;
 
         // ── Pause: prompt user to confirm before continuing ───────────────────
         if (showContinuePrompt && !waitForUserContinue()) {
@@ -1110,7 +1115,7 @@ public class USLExtractorGUI extends JFrame {
             }
 
             // Run Extract Current (no mid-sequence continue prompt for automated batches).
-            boolean completed = runExtractCurrentSequence(r, stepDelay, interval, removeDelay, false);
+            boolean completed = runExtractCurrentSequence(r, stepDelay, interval, removeDelay, false, batch == 0);
             if (!completed) return false;
 
             // After Extract Current, cursor ends near removePlayersPos[1].
