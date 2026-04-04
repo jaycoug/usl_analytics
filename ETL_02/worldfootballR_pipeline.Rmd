@@ -1,0 +1,610 @@
+---
+title: "FBref → SQLite Pipeline"
+subtitle: "Getting started with worldfootballR and importing per-match player data"
+author: "USL Championship Data Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+---
+
+# Overview
+
+This document is a guided workflow for pulling USL Championship data from
+[FBref.com](https://fbref.com) using the
+[worldfootballR](https://jaseziv.github.io/worldfootballR/) R package, and
+writing it into the local SQLite database.
+
+**End goal:** populate the `matches` and `appearances` tables with real FBref
+data so that any player's per-match statistics — minutes, goals, assists,
+shots, passing, defensive actions, cards — are queryable in one place.
+
+**Why worldfootballR instead of direct scraping?**
+FBref is protected by Cloudflare and serves several data tables inside HTML
+comments. worldfootballR handles both of those obstacles internally, and
+adds built-in rate-limiting so your requests don't get blocked.
+
+---
+
+# 1. Installation and Setup
+
+Run this block once per machine to install all required packages.
+
+```{r install, eval=FALSE}
+install.packages(c(
+  "worldfootballR",   # FBref scraping
+  "DBI",              # database interface
+  "RSQLite",          # SQLite driver
+  "tidyverse",        # data wrangling
+  "stringdist"        # fuzzy name matching for player linking
+))
+```
+
+```{r libraries}
+library(worldfootballR)
+library(DBI)
+library(RSQLite)
+library(tidyverse)
+library(stringdist)
+```
+
+```{r connect}
+# This file lives in ETL_02/; the database is one level up.
+# Adjust the path if you move either file.
+DB_PATH <- "../usl_championship_26.db"
+con <- dbConnect(RSQLite::SQLite(), dbname = DB_PATH)
+```
+
+---
+
+# 2. What Data Is Available for USL Championship
+
+FBref covers USL Championship, but the depth of data depends on the season
+and whether match officials submitted detailed reports.  Here is what to
+realistically expect:
+
+| Data type | FBref availability | Maps to DB table |
+|---|---|---|
+| Match results (score, date, teams) | ✅ Full coverage | `matches` |
+| Squad season totals | ✅ Full coverage | `season_team_stats` |
+| Player match summary (mins, goals, assists, shots, cards) | ✅ Most matches | `appearances` |
+| Player match passing stats | ⚠️ Varies by match | `appearances` |
+| Player match defensive actions | ⚠️ Varies by match | `appearances` |
+| Player match advanced possession | ⚠️ Varies by match | — |
+| Lineups / starters vs. substitutes | ✅ Most matches | `appearances.is_starter` |
+| xG, progressive passes, carries | ⚠️ Limited for USL | — |
+
+> **Note:** When a match has incomplete advanced stats, `fb_advanced_match_stats()`
+> returns an empty data frame for that URL.  The pipeline below handles this
+> gracefully by skipping empty results.
+
+---
+
+# 3. Orientation: Season Team Stats
+
+This is the simplest call and a good sanity-check that your connection to
+FBref is working before you run the heavier match-level pulls.
+
+```{r team-stats, eval=FALSE}
+# Pull standard squad stats for the current USL Championship season.
+# stat_type options: "standard", "shooting", "passing", "defense",
+#                    "possession", "playing_time", "misc", "keeper"
+squad_stats <- fb_season_team_stats(
+  country         = "USA",
+  gender          = "M",
+  season_end_year = 2026,
+  tier            = "3rd",          # USL Championship = 3rd tier
+  stat_type       = "standard"
+)
+
+glimpse(squad_stats)
+```
+
+```{r team-stats-demo, echo=FALSE}
+# Placeholder output shown when eval=FALSE above.
+# Replace with the live result after running the chunk above.
+message("(Run the chunk above with internet access to see live FBref data.)")
+```
+
+Key columns returned: `Squad`, `Poss`, `Gls`, `Ast`, `xG`, `MP`, and the
+FBref URL for each squad — which you will use in the next section.
+
+---
+
+# 4. Match Results and Match URLs
+
+`fb_match_results()` returns every match for a season, including the
+individual match page URLs.  Those URLs are the input for all per-match
+player stat calls.
+
+```{r match-results, eval=FALSE}
+match_results <- fb_match_results(
+  country         = "USA",
+  gender          = "M",
+  season_end_year = 2026,
+  tier            = "3rd"
+)
+
+# Key columns: Date, Home, Away, HomeGoals, AwayGoals, MatchURL
+glimpse(match_results)
+```
+
+```{r match-url-filter, eval=FALSE}
+# Keep only completed matches (no MatchURL means the match hasn't
+# been played yet or the report hasn't been filed).
+completed <- match_results |>
+  filter(!is.na(MatchURL), !is.na(HomeGoals))
+
+cat("Completed matches with report URLs:", nrow(completed), "\n")
+
+# Save URLs as a vector for the next steps.
+match_urls <- completed$MatchURL
+```
+
+---
+
+# 5. Per-Match Player Statistics
+
+This is the core of the pipeline.  `fb_advanced_match_stats()` fetches a
+single stat type for a batch of match URLs and returns one row per player
+per match.
+
+**Important:** FBref rate-limits requests.  Do not remove the `Sys.sleep()`
+calls.  worldfootballR adds its own delay, but an explicit pause between
+batches keeps you well within their tolerance.
+
+## 5a. Summary stats (minutes, goals, assists, shots, cards)
+
+```{r match-summary-stats, eval=FALSE}
+# Pull in batches of 10 to be polite to FBref's servers.
+batch_size <- 10
+summary_list <- list()
+
+for (i in seq(1, length(match_urls), by = batch_size)) {
+  batch <- match_urls[i:min(i + batch_size - 1, length(match_urls))]
+
+  result <- tryCatch(
+    fb_advanced_match_stats(
+      match_url       = batch,
+      stat_type       = "summary",
+      team_or_player  = "player"
+    ),
+    error = function(e) {
+      message("Batch ", i, " error: ", e$message)
+      NULL
+    }
+  )
+
+  if (!is.null(result) && nrow(result) > 0) {
+    summary_list[[length(summary_list) + 1]] <- result
+  }
+
+  Sys.sleep(3)   # pause between batches
+}
+
+player_summary <- bind_rows(summary_list)
+glimpse(player_summary)
+```
+
+Key columns from `stat_type = "summary"`:
+`Player`, `Team`, `Match_Date`, `MatchURL`, `Min`, `Gls`, `Ast`, `Sh`,
+`SoT`, `CrdY`, `CrdR`, `Starting` ("Pitch" = starter, "Bench" = sub).
+
+## 5b. Passing stats
+
+```{r match-passing-stats, eval=FALSE}
+passing_list <- list()
+
+for (i in seq(1, length(match_urls), by = batch_size)) {
+  batch <- match_urls[i:min(i + batch_size - 1, length(match_urls))]
+
+  result <- tryCatch(
+    fb_advanced_match_stats(
+      match_url      = batch,
+      stat_type      = "passing",
+      team_or_player = "player"
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(result) && nrow(result) > 0) {
+    passing_list[[length(passing_list) + 1]] <- result
+  }
+
+  Sys.sleep(3)
+}
+
+player_passing <- bind_rows(passing_list)
+```
+
+Key columns: `Cmp` (passes completed), `Att` (passes attempted),
+`Cmp_pct`, `KP` (key passes), `PPA` (passes into penalty area).
+
+## 5c. Defensive actions
+
+```{r match-defense-stats, eval=FALSE}
+defense_list <- list()
+
+for (i in seq(1, length(match_urls), by = batch_size)) {
+  batch <- match_urls[i:min(i + batch_size - 1, length(match_urls))]
+
+  result <- tryCatch(
+    fb_advanced_match_stats(
+      match_url      = batch,
+      stat_type      = "defense",
+      team_or_player = "player"
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(result) && nrow(result) > 0) {
+    defense_list[[length(defense_list) + 1]] <- result
+  }
+
+  Sys.sleep(3)
+}
+
+player_defense <- bind_rows(defense_list)
+```
+
+Key columns: `Tkl` (tackles), `TklW` (tackles won), `Int` (interceptions),
+`Blocks`, `Clr` (clearances).
+
+---
+
+# 6. Joining and Cleaning the Fetched Data
+
+Merge all three stat frames on the shared keys: `Player`, `Team`,
+`MatchURL`.  Some matches won't have passing or defensive breakdowns —
+those will be `NA` after the join, which is fine.
+
+```{r join-stats, eval=FALSE}
+# Minimal column selection avoids duplicate-column collisions.
+summary_slim <- player_summary |>
+  select(Player, Team, MatchURL, Match_Date,
+         Min, Gls, Ast, Sh, CrdY, CrdR, Starting)
+
+passing_slim <- player_passing |>
+  select(Player, Team, MatchURL, Cmp, Att, KP) |>
+  rename(passes_completed = Cmp, passes_attempted = Att, key_passes = KP)
+
+defense_slim <- player_defense |>
+  select(Player, Team, MatchURL, TklW, Int, Blocks, Clr) |>
+  rename(tackles_won = TklW, interceptions = Int, blocks = Blocks,
+         clearances = Clr)
+
+player_match_stats <- summary_slim |>
+  left_join(passing_slim, by = c("Player", "Team", "MatchURL")) |>
+  left_join(defense_slim, by = c("Player", "Team", "MatchURL")) |>
+  mutate(
+    is_starter     = as.integer(Starting == "Pitch"),
+    minutes_played = suppressWarnings(as.integer(Min)),
+    goals          = replace_na(Gls, 0L),
+    assists        = replace_na(Ast, 0L),
+    shots          = replace_na(Sh,  0L),
+    yellow_cards   = replace_na(CrdY, 0L),
+    red_cards      = replace_na(CrdR, 0L),
+    passes         = replace_na(passes_completed, NA_integer_),
+    interceptions  = replace_na(interceptions, NA_integer_)
+  ) |>
+  select(-Min, -Gls, -Ast, -Sh, -CrdY, -CrdR, -Starting)
+
+glimpse(player_match_stats)
+```
+
+---
+
+# 7. Linking FBref Data to Your Database
+
+FBref uses its own player/team names which may not match your DB exactly.
+This section resolves both.
+
+## 7a. Match FBref team names → `team_abv`
+
+```{r team-linking, eval=FALSE}
+db_teams <- dbGetQuery(con, "SELECT team_abv, name FROM teams")
+
+# Normalize: lowercase, strip punctuation
+norm <- function(x) tolower(gsub("[^a-z0-9 ]", "", x))
+
+db_teams <- db_teams |>
+  mutate(name_norm = norm(name))
+
+fbref_teams <- player_match_stats |>
+  distinct(Team) |>
+  mutate(team_norm = norm(Team))
+
+# Fuzzy join: pick the closest DB team name for each FBref team name
+team_map <- fbref_teams |>
+  rowwise() |>
+  mutate(
+    best_match_idx = which.min(stringdist(team_norm, db_teams$name_norm,
+                                          method = "jw")),
+    team_abv       = db_teams$team_abv[best_match_idx],
+    matched_name   = db_teams$name[best_match_idx],
+    distance       = min(stringdist(team_norm, db_teams$name_norm,
+                                    method = "jw"))
+  ) |>
+  ungroup()
+
+# Review matches with distance > 0.15 — those may need manual correction.
+team_map |> filter(distance > 0.15) |> print()
+```
+
+> **Review the flagged rows** before proceeding.  You can correct them by
+> adding explicit overrides:
+> ```r
+> team_map <- team_map |>
+>   mutate(team_abv = case_when(
+>     Team == "Some FBref Name" ~ "CORRECT_ABV",
+>     TRUE ~ team_abv
+>   ))
+> ```
+
+## 7b. Link FBref player names → `player_id`
+
+The same fuzzy-matching approach is used for players, scoped within each
+team's roster so a common name like "David Smith" on different teams doesn't
+collide.
+
+```{r player-linking, eval=FALSE}
+db_players <- dbGetQuery(con, "
+  SELECT p.player_id, p.name,
+         sr.team_abv, sr.season
+  FROM players p
+  JOIN season_rosters sr ON p.player_id = sr.player_id
+  WHERE sr.season = 2026
+") |>
+  mutate(name_norm = norm(name))
+
+# Add team_abv to the FBref stats using the team map built above.
+player_match_stats <- player_match_stats |>
+  left_join(select(team_map, Team, team_abv), by = "Team") |>
+  mutate(player_norm = norm(Player))
+
+# For each row in the FBref data, find the closest player on that team's roster.
+link_player <- function(player_norm_val, team_abv_val, db_players) {
+  candidates <- db_players |> filter(team_abv == team_abv_val)
+  if (nrow(candidates) == 0) return(NA_integer_)
+  distances <- stringdist(player_norm_val, candidates$name_norm, method = "jw")
+  best <- which.min(distances)
+  if (distances[best] > 0.20) return(NA_integer_)  # threshold: no confident match
+  candidates$player_id[best]
+}
+
+player_match_stats <- player_match_stats |>
+  rowwise() |>
+  mutate(player_id = link_player(player_norm, team_abv, db_players)) |>
+  ungroup()
+
+# How many rows were matched?
+cat("Matched:", sum(!is.na(player_match_stats$player_id)),
+    "/", nrow(player_match_stats), "player-match rows\n")
+
+# Unmatched rows — review and add to players table if legitimate new players.
+unmatched <- player_match_stats |> filter(is.na(player_id))
+print(unmatched |> select(Player, Team, team_abv) |> distinct())
+```
+
+---
+
+# 8. Writing to the Database
+
+## 8a. Insert new matches into `matches`
+
+FBref match results must be written to `matches` first because
+`appearances.match_id` is a foreign key referencing it.
+
+```{r write-matches, eval=FALSE}
+# Map the FBref match results frame (from Section 4) to the DB schema.
+existing_match_urls <- dbGetQuery(con,
+  "SELECT fbref_url FROM matches WHERE fbref_url IS NOT NULL"
+)$fbref_url
+
+new_matches <- completed |>
+  filter(!MatchURL %in% existing_match_urls) |>
+  left_join(select(team_map, Team, team_abv), by = c("Home" = "Team")) |>
+  rename(home_team_abv = team_abv) |>
+  left_join(select(team_map, Team, team_abv), by = c("Away" = "Team")) |>
+  rename(away_team_abv = team_abv) |>
+  transmute(
+    date          = as.character(Date),
+    home_team_abv = home_team_abv,
+    away_team_abv = away_team_abv,
+    home_score    = as.integer(HomeGoals),
+    away_score    = as.integer(AwayGoals),
+    competition   = "USL Championship",
+    fbref_url     = MatchURL          # store URL so we can skip re-imports
+  )
+
+# NOTE: your current matches schema doesn't have a fbref_url column yet.
+# Add it once with:
+#   dbExecute(con, "ALTER TABLE matches ADD COLUMN fbref_url TEXT")
+# Then this insert will work cleanly on subsequent runs.
+
+dbAppendTable(con, "matches", new_matches)
+cat("Inserted", nrow(new_matches), "new match rows.\n")
+```
+
+## 8b. Insert player appearances
+
+```{r write-appearances, eval=FALSE}
+# Fetch the match_ids just inserted (needed to link appearances).
+db_matches <- dbGetQuery(con,
+  "SELECT match_id, fbref_url FROM matches WHERE fbref_url IS NOT NULL"
+)
+
+# Check which (match_id, player_id) pairs are already in appearances
+# so we don't double-insert on re-runs.
+existing_app <- dbGetQuery(con,
+  "SELECT match_id, player_id FROM appearances"
+)
+
+new_appearances <- player_match_stats |>
+  filter(!is.na(player_id), !is.na(team_abv)) |>
+  left_join(db_matches, by = c("MatchURL" = "fbref_url")) |>
+  filter(!is.na(match_id)) |>
+  anti_join(existing_app, by = c("match_id", "player_id")) |>
+  transmute(
+    match_id       = match_id,
+    player_id      = player_id,
+    team_abv       = team_abv,
+    minutes_played = minutes_played,
+    is_starter     = is_starter,
+    goals          = goals,
+    shots          = shots,
+    passes         = passes,
+    assists        = assists,
+    interceptions  = interceptions,
+    duels_won      = NA_integer_,    # not in FBref summary; extend if needed
+    yellow_cards   = yellow_cards,
+    red_cards      = red_cards
+  )
+
+dbAppendTable(con, "appearances", new_appearances)
+cat("Inserted", nrow(new_appearances), "appearance rows.\n")
+```
+
+---
+
+# 9. Querying the Result
+
+Once both tables are populated, a player's per-match performance is a
+straightforward join:
+
+```{r query-player-matches, eval=FALSE}
+player_name_search <- "Ropapa Mensah"   # change to any player
+
+dbGetQuery(con, "
+  SELECT
+    m.date,
+    home.name  AS home_team,
+    away.name  AS away_team,
+    m.home_score,
+    m.away_score,
+    a.minutes_played,
+    a.is_starter,
+    a.goals,
+    a.assists,
+    a.shots,
+    a.passes,
+    a.interceptions,
+    a.yellow_cards,
+    a.red_cards
+  FROM appearances a
+  JOIN matches  m    ON a.match_id       = m.match_id
+  JOIN teams    home ON m.home_team_abv  = home.team_abv
+  JOIN teams    away ON m.away_team_abv  = away.team_abv
+  JOIN players  p    ON a.player_id      = p.player_id
+  WHERE p.name = ?
+  ORDER BY m.date
+", params = list(player_name_search))
+```
+
+---
+
+# 10. Projected Full Pipeline (Repeatable Workflow)
+
+Once the initial load is complete, refreshing with new match data is a
+five-step process.  Run this sequence after each matchday.
+
+```{r full-pipeline, eval=FALSE}
+# ── Step 1: Pull current season match results ──────────────────────────────
+match_results <- fb_match_results(
+  country = "USA", gender = "M", season_end_year = 2026, tier = "3rd"
+)
+
+completed <- match_results |> filter(!is.na(MatchURL), !is.na(HomeGoals))
+
+# ── Step 2: Identify only new matches not yet in the DB ───────────────────
+existing_urls <- dbGetQuery(con,
+  "SELECT fbref_url FROM matches WHERE fbref_url IS NOT NULL"
+)$fbref_url
+
+new_urls <- setdiff(completed$MatchURL, existing_urls)
+cat(length(new_urls), "new match(es) to process.\n")
+
+if (length(new_urls) == 0) {
+  message("Database is already current — nothing to import.")
+  stop()
+}
+
+# ── Step 3: Fetch player stats for new matches only ───────────────────────
+fetch_stat <- function(urls, stat_type, batch = 10, pause = 3) {
+  out <- list()
+  for (i in seq(1, length(urls), by = batch)) {
+    b <- urls[i:min(i + batch - 1, length(urls))]
+    res <- tryCatch(
+      fb_advanced_match_stats(b, stat_type = stat_type,
+                               team_or_player = "player"),
+      error = function(e) NULL
+    )
+    if (!is.null(res) && nrow(res) > 0) out[[length(out) + 1]] <- res
+    Sys.sleep(pause)
+  }
+  bind_rows(out)
+}
+
+raw_summary  <- fetch_stat(new_urls, "summary")
+raw_passing  <- fetch_stat(new_urls, "passing")
+raw_defense  <- fetch_stat(new_urls, "defense")
+
+# ── Step 4: Clean, join, and link to DB ids  ──────────────────────────────
+# (Reuse the joining and linking code from Sections 6 and 7.)
+# team_map and db_players should be rebuilt here if running as a
+# standalone script rather than continuing a session.
+
+# ── Step 5: Write to DB ───────────────────────────────────────────────────
+# (Reuse the dbAppendTable blocks from Section 8.)
+
+dbDisconnect(con)
+message("Pipeline complete.")
+```
+
+---
+
+# 11. Schema Note: `fbref_url` Column
+
+The pipeline above stores each FBref match URL in a `fbref_url` column on
+the `matches` table.  This is what makes incremental updates safe — the
+script skips any match already in the DB.  Add the column once:
+
+```{r add-fbref-url-col, eval=FALSE}
+dbExecute(con, "ALTER TABLE matches ADD COLUMN fbref_url TEXT")
+```
+
+This is non-destructive and does not affect any existing rows.
+
+---
+
+# 12. Disconnect
+
+```{r disconnect}
+if (exists("con") && dbIsValid(con)) {
+  dbDisconnect(con)
+  message("Database connection closed.")
+}
+```
+
+---
+
+*worldfootballR documentation: https://jaseziv.github.io/worldfootballR/*
+*FBref USL Championship: https://fbref.com/en/comps/73/USL-Championship-Stats*
